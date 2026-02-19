@@ -86,6 +86,7 @@ python -m openrlhf.cli.train_ppo_ray \
     --offload \
     --adam_offload \
     --gradient_checkpointing \
+    --gradient_checkpointing_use_reentrant \
     --param_dtype bf16 \
     --actor_learning_rate 1e-6 \
     --save_path "$SAVE_PATH" \

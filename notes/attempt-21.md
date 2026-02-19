@@ -17,4 +17,14 @@ bash train_grpo.sh > train.log 2>&1
 Key flags: `--offload`, `--adam_offload`, `--vllm_sync_with_ray`, `--zero_stage 3`, `--vllm_gpu_memory_utilization 0.80`, `--init_kl_coef 0`, `--actor_num_gpus_per_node 4`, `--vllm_num_engines 2`, `--vllm_tensor_parallel_size 2`
 
 ## Result
-- Training in progress...
+- **OOM RESOLVED**: Actor GPUs now use only 5-10 GB (down from 66 GB), with 71-75 GB free.
+- Rollout generation completed successfully (8 prompts × 8 samples).
+- Forward pass completed (compute log probs on generated samples) ✅
+- **NEW FAILURE**: `torch.utils.checkpoint.CheckpointError` during backward pass.
+  - Error: "Recomputed values for tensors have different metadata than during forward pass"
+  - saved: `shape=[2880]`, recomputed: `shape=[0]` (ZeRO-3 partitioned/offloaded)
+  - Non-reentrant gradient checkpointing validates tensor shapes, but with ZeRO-3 CPU offload,
+    params are shape [2880] during forward (gathered) and shape [0] during backward recomputation
+    (before gather).
+- **Fix**: Use reentrant gradient checkpointing (`--gradient_checkpointing_use_reentrant`),
+  which skips the strict metadata validation.

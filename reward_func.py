@@ -21,7 +21,11 @@ logger = logging.getLogger(__name__)
 
 # Lazy-init Gemini client (initialized on first call)
 _gemini_client = None
-GEMINI_MODEL = "gemini-3-pro-preview"
+GEMINI_MODELS = [
+    "gemini-3-pro-preview",
+    "gemini-3.1-pro-preview",
+    "gemini-3-flash-preview",
+]
 GEMINI_PROJECT = os.environ.get("GOOGLE_CLOUD_PROJECT", "wf30-poc")
 GEMINI_LOCATION = os.environ.get("GOOGLE_CLOUD_LOCATION", "global")
 
@@ -180,51 +184,55 @@ Rate the reasoning quality of the student's solution on a scale from 0.0 to 1.0:
 
 Respond with ONLY a decimal number between 0.0 and 1.0, nothing else."""
 
-    client = _get_gemini_client()
-    for attempt in range(GEMINI_MAX_RETRIES):
-        try:
-            from google.genai import types
+    from google.genai import types
 
-            response = client.models.generate_content(
-                model=GEMINI_MODEL,
-                contents=prompt,
-                config=types.GenerateContentConfig(
-                    max_output_tokens=16,
-                    temperature=0.0,
-                ),
-            )
-            # Handle None/empty response (safety filter or empty generation)
-            if response.text is None:
-                logger.warning(f"Gemini returned None text (attempt {attempt + 1}/{GEMINI_MAX_RETRIES})")
-                if attempt < GEMINI_MAX_RETRIES - 1:
-                    time.sleep(GEMINI_RETRY_DELAY * (attempt + 1) + random.uniform(0, 1))
-                continue
-            text = response.text.strip()
-            if not text:
-                logger.warning(f"Gemini returned empty text (attempt {attempt + 1}/{GEMINI_MAX_RETRIES})")
-                if attempt < GEMINI_MAX_RETRIES - 1:
-                    time.sleep(GEMINI_RETRY_DELAY * (attempt + 1) + random.uniform(0, 1))
-                continue
-            # Try direct float parse first
+    client = _get_gemini_client()
+
+    for model_id in GEMINI_MODELS:
+        for attempt in range(GEMINI_MAX_RETRIES):
             try:
-                score = float(text)
-                return max(0.0, min(1.0, score))
-            except ValueError:
-                pass
-            # Extract first number from response text (Gemini sometimes adds explanation)
-            numbers = re.findall(r"(?:^|\s)(0\.\d+|1\.0|0|1)(?:\s|$|[,.])", text)
-            if numbers:
-                score = float(numbers[0])
-                return max(0.0, min(1.0, score))
-            logger.warning(f"Gemini non-numeric response (attempt {attempt + 1}/{GEMINI_MAX_RETRIES}): {text[:80]}")
-            if attempt < GEMINI_MAX_RETRIES - 1:
-                time.sleep(GEMINI_RETRY_DELAY * (attempt + 1) + random.uniform(0, 1))
-        except Exception as e:
-            logger.warning(f"Gemini API error (attempt {attempt + 1}/{GEMINI_MAX_RETRIES}): {e}")
-            if attempt < GEMINI_MAX_RETRIES - 1:
-                # Exponential backoff with jitter for rate limiting
-                time.sleep(GEMINI_RETRY_DELAY * (2 ** attempt) + random.uniform(0, 2))
-    return -1.0  # Sentinel: indicates Gemini failure
+                response = client.models.generate_content(
+                    model=model_id,
+                    contents=prompt,
+                    config=types.GenerateContentConfig(
+                        max_output_tokens=16,
+                        temperature=0.0,
+                    ),
+                )
+                # Handle None/empty response (safety filter or empty generation)
+                if response.text is None:
+                    logger.warning(f"Gemini [{model_id}] returned None text (attempt {attempt + 1}/{GEMINI_MAX_RETRIES})")
+                    if attempt < GEMINI_MAX_RETRIES - 1:
+                        time.sleep(GEMINI_RETRY_DELAY * (attempt + 1) + random.uniform(0, 1))
+                    continue
+                text = response.text.strip()
+                if not text:
+                    logger.warning(f"Gemini [{model_id}] returned empty text (attempt {attempt + 1}/{GEMINI_MAX_RETRIES})")
+                    if attempt < GEMINI_MAX_RETRIES - 1:
+                        time.sleep(GEMINI_RETRY_DELAY * (attempt + 1) + random.uniform(0, 1))
+                    continue
+                # Try direct float parse first
+                try:
+                    score = float(text)
+                    return max(0.0, min(1.0, score))
+                except ValueError:
+                    pass
+                # Extract first number from response text (Gemini sometimes adds explanation)
+                numbers = re.findall(r"(?:^|\s)(0\.\d+|1\.0|0|1)(?:\s|$|[,.])", text)
+                if numbers:
+                    score = float(numbers[0])
+                    return max(0.0, min(1.0, score))
+                logger.warning(f"Gemini [{model_id}] non-numeric response (attempt {attempt + 1}/{GEMINI_MAX_RETRIES}): {text[:80]}")
+                if attempt < GEMINI_MAX_RETRIES - 1:
+                    time.sleep(GEMINI_RETRY_DELAY * (attempt + 1) + random.uniform(0, 1))
+            except Exception as e:
+                logger.warning(f"Gemini [{model_id}] API error (attempt {attempt + 1}/{GEMINI_MAX_RETRIES}): {e}")
+                if attempt < GEMINI_MAX_RETRIES - 1:
+                    # Exponential backoff with jitter for rate limiting
+                    time.sleep(GEMINI_RETRY_DELAY * (2 ** attempt) + random.uniform(0, 2))
+        logger.warning(f"Gemini [{model_id}] exhausted retries, falling back to next model")
+
+    return -1.0  # Sentinel: all Gemini models failed
 
 
 def reward_func(queries: list[str], prompts: list[str], labels: list[str]) -> dict:

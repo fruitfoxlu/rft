@@ -1,0 +1,39 @@
+--- /tmp/openrlhf_pkg/openrlhf_orig/openrlhf-0.9.3.data/purelib/openrlhf/trainer/ray/ppo_actor.py	2026-02-05 12:33:06.000000000 +0000
++++ /opt/conda/envs/rft/lib/python3.10/site-packages/openrlhf/trainer/ray/ppo_actor.py	2026-02-19 21:23:28.905542002 +0000
+@@ -136,15 +136,36 @@
+                 )
+                 for i, engine in enumerate(self.vllm_engines)
+             ]
++            # Synchronize CUDA and clear caches before creating sync group
++            torch.cuda.synchronize()
++            torch.cuda.empty_cache()
++
+             if use_ray:
+                 import ray.util.collective as collective
+ 
++                print(f"[INFO] Creating Ray collective group: backend={backend}, world_size={world_size}, rank=0")
+                 collective.init_collective_group(world_size=world_size, rank=0, backend=backend, group_name=group_name)
+                 self._model_update_group = group_name
++                print(f"[INFO] Ray collective group created successfully")
+             else:
++                # Clear any pending CUDA errors before NCCL communicator init.
++                import ctypes
++                try:
++                    _libcudart = ctypes.CDLL("libcudart.so")
++                    _cuda_err = _libcudart.cudaGetLastError()
++                    if _cuda_err != 0:
++                        print(f"[WARN] Cleared pending CUDA error code: {_cuda_err}")
++                        _libcudart.cudaDeviceSynchronize()
++                        _cuda_err2 = _libcudart.cudaGetLastError()
++                        print(f"[WARN] After sync, CUDA error code: {_cuda_err2}")
++                except Exception as e:
++                    print(f"[WARN] CUDA error clearing failed: {e}")
++
++                print(f"[INFO] Creating NCCL sync group: device={torch.cuda.current_device()}, world_size={world_size}")
+                 self._model_update_group = stateless_init_process_group(
+                     master_address, master_port, 0, world_size, torch.cuda.current_device()
+                 )
++                print(f"[INFO] NCCL sync group created successfully")
+ 
+             ray.get(refs)
+ 

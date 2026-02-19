@@ -83,6 +83,7 @@ python -m openrlhf.cli.train_ppo_ray \
     --vllm_tensor_parallel_size 2 \
     --vllm_gpu_memory_utilization 0.80 \
     --zero_stage 3 \
+    --offload \
     --adam_offload \
     --gradient_checkpointing \
     --param_dtype bf16 \

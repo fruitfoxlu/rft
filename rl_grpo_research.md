@@ -128,11 +128,28 @@ reasoning_quality:  Gemini 3 Pro rates solution quality on [0, 1] scale
 - **Lesson**: **NCCL-based weight sync is fragile across Ray actor boundaries**, especially with vLLM v1's EngineCore subprocess architecture. Ray object store is slower (~6s vs ~1s) but reliable.
 - **New problem**: Disk full — checkpoints consumed 422 GB on 1TB disk
 
-### Attempt 24: Checkpoint disk fix (CURRENT)
+### Attempt 24: Checkpoint disk fix
 - **Problem**: PeftModel.save_pretrained() with ZeRO-3 writes full-model shards (203 GB) alongside adapter_model.bin (91 MB)
 - **Fix**: Patch save_model to clean up pytorch_model-*.bin shards after saving adapter; disable DeepSpeed intermediate checkpoints
 - **Lesson**: **PeftModel + ZeRO-3 save is broken by default.** Must explicitly clean up full-model shard files. Also: always set `--max_ckpt_num` and `--disable_ds_ckpt` to avoid disk runaway.
-- **Status**: Training running, 10+ steps completed, first checkpoint verified at 91 MB
+- **Result**: 17 steps completed. Training functional but lacked diagnostics.
+  Correctness dropped to 9.4-14.1% at steps 16-17 once LR hit peak — could not
+  diagnose root cause without gradient norms or advantage stats. Stopped to add monitoring.
+
+### Attempt 25: Enhanced metrics + held-out eval (CURRENT)
+- **Problem**: Attempt 24 showed loss spikes (act_loss=2.69) and sudden correctness
+  drops (step 16: 9.4%) without diagnostic data to determine if these were random
+  bad batches, LR-shock, or systematic instability
+- **Fix**: Added 3 new patches for comprehensive monitoring:
+  - `metrics_actor.patch`: gradient norm, advantage stats, entropy distribution
+  - `metrics_experience.patch`: reward distribution, high-reward-but-wrong detection
+  - `metrics_trainer.patch`: per-step JSONL to /mnt/scratch, sample output logging
+  - Built-in held-out eval every 10 steps via `--eval_dataset`
+  - Entropy logging via `--entropy_loss_coef 0`
+  - Checkpoints/output on /mnt/data (1TB), metrics on /mnt/scratch (5.9TB)
+- **Lesson**: **Instrument before you train.** Without grad norms, advantage stats,
+  and held-out eval, you can observe problems but not diagnose them.
+- **Status**: Starting...
 
 ### Summary: What Broke and What Fixed It
 
@@ -148,7 +165,7 @@ reasoning_quality:  Gemini 3 Pro rates solution quality on [0, 1] scale
 
 ## 4. Training Metrics — Attempt 24
 
-### 4.1 Per-Step Summary (Global Steps 1–10)
+### 4.1 Per-Step Summary (Global Steps 1–17)
 
 | Step | policy_loss | reward | correctness | reasoning_q | response_len | truncated | ppo_clip | ppo_kl | actor_lr |
 |------|------------|--------|-------------|-------------|-------------|-----------|----------|--------|----------|
@@ -162,20 +179,28 @@ reasoning_quality:  Gemini 3 Pro rates solution quality on [0, 1] scale
 | 8 | 0.090 | **0.704** | **64.1%** | **0.800** | 2397 | 34.4% | 0.254 | -0.029 | 5.6e-7 |
 | 9 | 0.060 | 0.470 | 37.5% | 0.613 | 2780 | 64.1% | 0.224 | +0.006 | 6.3e-7 |
 | 10 | 0.068 | 0.550 | 45.3% | 0.695 | 2407 | 59.4% | 0.191 | -0.025 | 7.0e-7 |
+| 12 | 0.235 | 0.591 | 51.6% | 0.704 | 2530 | 46.9% | 0.243 | +0.019 | 8.5e-7 |
+| 13 | 0.066 | 0.452 | 35.9% | 0.591 | 2795 | 64.1% | 0.234 | +0.017 | 9.3e-7 |
+| 14 | 0.055 | 0.396 | 29.7% | 0.544 | 2463 | 62.5% | 0.237 | -0.004 | 9.9e-7 |
+| 15 | 0.102 | **0.696** | **57.8%** | **0.873** | 2626 | 40.6% | 0.241 | +0.011 | **1.0e-6** |
+| 16 | 0.073 | **0.235** | **9.4%** | 0.447 | 3001 | **85.9%** | 0.313 | -0.005 | 1.0e-6 |
+| 17 | 0.143 | **0.271** | **14.1%** | 0.466 | 3012 | **85.9%** | 0.330 | +0.009 | 1.0e-6 |
 
 ### 4.2 Trend Analysis
 
-**Reward**: Noisy but slightly positive trend. Steps 1-5 avg: 0.457, Steps 6-10 avg: 0.516 (+13%).
+**Reward**: Noisy. Steps 1-5 avg: 0.457, Steps 6-10 avg: 0.516 (+13%), but steps 16-17 crashed to 0.235-0.271.
 
-**Correctness**: High variance due to small batches (64 samples) on hard AIME problems. Range 18.8%–64.1%. No clear upward trend yet — still in LR warmup.
+**Correctness**: High variance due to small batches (64 samples) on hard AIME problems. Range 9.4%–64.1%. Steps 16-17 showed sharp collapse (9.4%, 14.1%) coinciding with LR reaching peak (1e-6).
 
 **Policy loss**: NOT expected to decrease monotonically in GRPO. This is a policy gradient loss (advantage-weighted log-prob shift), not supervised cross-entropy. Oscillation around 0.06–0.25 is normal.
 
-**Response length**: Averaging ~2600 tokens. Step 7 spiked to 3029 with 84.4% truncation — model may be learning to "think longer" on hard problems.
+**Response length**: Averaging ~2600 tokens. Steps 16-17 both hit 3001-3012 with 85.9% truncation — model started generating near-max-length responses that fail to reach final answers.
 
-**ppo_clip_ratio**: 19-33% of updates are clipped. Healthy range for PPO/GRPO.
+**ppo_clip_ratio**: 19-33% of updates are clipped. Steps 16-17 showed higher clip ratios (0.313, 0.330) indicating more aggressive updates at peak LR.
 
 **ppo_kl**: Small oscillation -0.07 to +0.02. With `init_kl_coef=0` there's no penalty pushing back. This means the model is drifting slowly but unconstrained from the reference policy.
+
+**Key finding**: Steps 16-17 show a pattern consistent with LR-shock: the learning rate hit its peak (1e-6) at step 15, and the next two steps showed 85.9% truncation, <15% correctness, and elevated clip ratios. Without gradient norms and advantage stats, we cannot determine if this was caused by a single bad gradient update or a systematic instability. This motivated the restart with enhanced monitoring (attempt 25).
 
 ### 4.3 Micro-Batch Level Observations
 
@@ -264,6 +289,9 @@ All patches are in `patches/` and applied via `bash apply_patches.sh`.
 | `ppo_actor.patch` | CUDA sync before NCCL group init + Ray collective logging | Prevents stale CUDA errors from crashing NCCL communicator creation |
 | `experience_maker.patch` | Filter extra_logs to float-only | String values in extra_logs crash torch.tensor() |
 | `save_model.patch` | Clean up full-model shards after LoRA save + CPU offload fix | PeftModel.save_pretrained() + ZeRO-3 writes 203 GB of unnecessary shard files |
+| `metrics_actor.patch` | Grad norm, advantage stats, entropy distribution | Diagnose loss spikes and detect policy collapse |
+| `metrics_experience.patch` | Reward distribution stats, high-reward-but-wrong rate | Detect reward hacking and understand reward variance |
+| `metrics_trainer.patch` | Per-step JSONL + sample output logging to /mnt/scratch | Persistent metrics for post-hoc analysis and presentations |
 
 ---
 
@@ -344,4 +372,4 @@ All patches are in `patches/` and applied via `bash apply_patches.sh`.
 
 ---
 
-*Last updated: 2026-02-20, Step 10 of Attempt 24*
+*Last updated: 2026-02-20, Attempt 24 stopped at Step 17, Attempt 25 starting*

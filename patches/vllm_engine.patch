@@ -1,0 +1,76 @@
+--- a/openrlhf/trainer/ray/vllm_engine.py
++++ b/openrlhf/trainer/ray/vllm_engine.py
+@@ -116,6 +116,70 @@
+             args=(name, dtype, shape, empty_cache),
+         )
+
++    async def update_weight_from_ref(self, name, dtype, shape, weight_ref_bytes, empty_cache=False):
++        """Update a single weight from a Ray object store reference."""
++        import torch
++        weight_ref = ray.ObjectRef.from_binary(weight_ref_bytes)
++        weight_cpu = ray.get(weight_ref)
++        weight = weight_cpu.to(dtype=dtype, device="cuda")
++        del weight_cpu
++        model = self.llm.engine.engine_core.engine.model_runner.model
++        model.load_weights(weights=[(name, weight)])
++        del weight
++        if empty_cache:
++            torch.cuda.empty_cache()
++
++    async def apply_lora_update(self, lora_state, scaling):
++        """Apply LoRA adapter weight updates to the base model.
++
++        For each LoRA param pair (lora_A, lora_B), computes the delta:
++            W += scaling * B @ A
++        and applies it to the corresponding base weight.
++        """
++        import torch
++        import re
++
++        model = self.llm.engine.engine_core.engine.model_runner.model
++
++        # Group LoRA params by layer/module
++        lora_a_params = {}
++        lora_b_params = {}
++        for name, tensor in lora_state.items():
++            if ".lora_A." in name:
++                base_name = name.replace(".lora_A.default", "").replace(".lora_A.", ".")
++                lora_a_params[base_name] = tensor
++            elif ".lora_B." in name:
++                base_name = name.replace(".lora_B.default", "").replace(".lora_B.", ".")
++                lora_b_params[base_name] = tensor
++
++        updates = []
++        for base_name in lora_a_params:
++            if base_name in lora_b_params:
++                A = lora_a_params[base_name]
++                B = lora_b_params[base_name]
++                # Clean up the base_name to match vLLM model param names
++                # Remove 'base_model.model.' prefix from PEFT naming
++                clean_name = re.sub(r"^base_model\.model\.", "", base_name)
++                clean_name = re.sub(r"\.base_layer$", "", clean_name)
++                delta = (scaling * (B.float() @ A.float())).to(dtype=torch.bfloat16)
++                updates.append((clean_name, delta))
++
++        if updates:
++            # Get current weights and add deltas
++            for name, delta in updates:
++                delta_gpu = delta.to("cuda")
++                # Load as additive update
++                try:
++                    model.load_weights(weights=[(name, delta_gpu)], add_to_existing=True)
++                except TypeError:
++                    # Fallback: load_weights might not support add_to_existing
++                    # Get current weight, add delta, store back
++                    for pname, param in model.named_parameters():
++                        if pname == name:
++                            param.data.add_(delta_gpu)
++                            break
++                del delta_gpu
++
++        torch.cuda.empty_cache()
++        return len(updates)
++
+     async def update_weight_cuda_ipc(self, name, dtype, shape, ipc_handles, empty_cache=False):
+         return await self.llm.collective_rpc(
+             "update_weight_cuda_ipc",

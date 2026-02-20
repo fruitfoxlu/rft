@@ -1,0 +1,8 @@
+--- a/openrlhf/cli/train_ppo_ray.py
++++ b/openrlhf/cli/train_ppo_ray.py
+@@ -293,6 +293,7 @@
+     parser.add_argument("--ema_beta", type=float, default=0.992, help="EMA beta coefficient")
+     parser.add_argument("--zpg", type=int, default=1, help="ZeRO++ max partition size")
++    parser.add_argument("--offload", action="store_true", default=False, help="Offload parameters to CPU (ZeRO-3)")
+     parser.add_argument("--adam_offload", action="store_true", default=False, help="Offload Adam Optimizer")
+     parser.add_argument("--actor_init_on_gpu", action="store_true", default=False)

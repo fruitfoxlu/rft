@@ -15,8 +15,8 @@ echo "Applying patches to: $SITE_PKG"
 for patch in "$SCRIPT_DIR/patches"/*.patch; do
     name="$(basename "$patch")"
     echo "  Applying $name..."
-    # Use --directory to set the base path, strip 1 level from diff paths
-    patch -p0 --forward --directory="$SITE_PKG" < "$patch" 2>&1 || {
+    # Patches use a/openrlhf/... b/openrlhf/... paths; -p1 strips the a/ prefix
+    patch -p1 --forward --directory="$SITE_PKG" < "$patch" 2>&1 || {
         echo "  WARNING: $name may already be applied (or failed)"
     }
 done

@@ -1,0 +1,33 @@
+--- a/openrlhf/utils/deepspeed/deepspeed.py	2026-02-05 12:33:06.000000000 +0000
++++ b/openrlhf/utils/deepspeed/deepspeed.py	2026-02-20 17:32:41.324229386 +0000
+@@ -59,6 +59,7 @@
+         self.full_determinism = full_determinism
+         self.max_norm = max_norm
+ 
++        self.offload = getattr(args, "offload", False)
+         self.adam_offload = getattr(args, "adam_offload", False)
+         self.zpg = getattr(args, "zpg", 1)
+         self.use_ds_universal_ckpt = getattr(args, "use_ds_universal_ckpt", False)
+@@ -252,7 +253,7 @@
+     def get_ds_train_config(self, is_actor):
+         # DS Config
+         ds_config = get_train_ds_config(
+-            offload=False,
++            offload=self.offload,
+             adam_offload=self.adam_offload,
+             stage=self.stage,
+             param_dtype=self.param_dtype,
+@@ -388,6 +389,13 @@
+                     filename = os.path.join(output_dir, "adapter_model.safetensors")
+                     if os.path.exists(filename):
+                         os.remove(filename)
++                    # Clean up full-model shard files that PeftModel.save_pretrained()
++                    # incorrectly writes with ZeRO-3 (only adapter_model.bin is needed)
++                    import glob as _glob
++                    for shard_file in _glob.glob(os.path.join(output_dir, "pytorch_model-*.bin")):
++                        os.remove(shard_file)
++                    for shard_file in _glob.glob(os.path.join(output_dir, "model-*.safetensors")):
++                        os.remove(shard_file)
+             else:
+                 # save model
+                 model_to_save.save_pretrained(output_dir, state_dict=output_state_dict, **kwargs)

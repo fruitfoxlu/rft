@@ -22,8 +22,8 @@ logger = logging.getLogger(__name__)
 # Lazy-init Gemini client (initialized on first call)
 _gemini_client = None
 GEMINI_MODELS = [
-    "gemini-3-pro-preview",
     "gemini-3.1-pro-preview",
+    "gemini-3-pro-preview",
     "gemini-3-flash-preview",
 ]
 GEMINI_PROJECT = os.environ.get("GOOGLE_CLOUD_PROJECT", "wf30-poc")
@@ -162,31 +162,80 @@ def check_correctness(model_answer: str, ground_truth: str) -> float:
     return 0.0
 
 
-def get_reasoning_quality(problem: str, solution: str, ground_truth: str) -> float:
-    """Ask Gemini to rate the reasoning quality of a solution (0.0-1.0)."""
-    import random
-
-    prompt = f"""You are evaluating a math solution for reasoning quality.
-
-Problem: {problem}
-
-Student's Solution:
-{solution}
-
-Ground Truth Answer: {ground_truth}
-
-Rate the reasoning quality of the student's solution on a scale from 0.0 to 1.0:
-- 1.0: Clear, correct, well-structured reasoning throughout
-- 0.7-0.9: Mostly correct reasoning with minor issues
-- 0.4-0.6: Partially correct approach but significant gaps
-- 0.1-0.3: Shows some relevant thinking but mostly wrong
-- 0.0: No meaningful reasoning or completely wrong approach
-
-Respond with ONLY a decimal number between 0.0 and 1.0, nothing else."""
-
+def _get_safety_settings():
+    """Return permissive safety settings -- math solutions should never be blocked."""
     from google.genai import types
 
+    return [
+        types.SafetySetting(
+            category="HARM_CATEGORY_HARASSMENT",
+            threshold="OFF",
+        ),
+        types.SafetySetting(
+            category="HARM_CATEGORY_HATE_SPEECH",
+            threshold="OFF",
+        ),
+        types.SafetySetting(
+            category="HARM_CATEGORY_SEXUALLY_EXPLICIT",
+            threshold="OFF",
+        ),
+        types.SafetySetting(
+            category="HARM_CATEGORY_DANGEROUS_CONTENT",
+            threshold="OFF",
+        ),
+    ]
+
+
+def _extract_score(text: str) -> float | None:
+    """Extract a score from Gemini's response text, handling various formats."""
+    text = text.strip()
+    # Try direct float parse
+    try:
+        return max(0.0, min(1.0, float(text)))
+    except ValueError:
+        pass
+    # Look for number patterns: "0.7", "1.0", "0", "1", "0.85"
+    numbers = re.findall(r"(\d+\.?\d*)", text)
+    if numbers:
+        for n in numbers:
+            try:
+                val = float(n)
+                if 0.0 <= val <= 1.0:
+                    return val
+            except ValueError:
+                continue
+    return None
+
+
+GEMINI_JSON_SCHEMA = {
+    "type": "object",
+    "properties": {
+        "score": {"type": "number", "description": "Reasoning quality from 0.0 to 1.0"},
+        "reason": {"type": "string", "description": "Brief explanation of the score"},
+    },
+    "required": ["score", "reason"],
+}
+
+
+def get_reasoning_quality(problem: str, solution: str, ground_truth: str) -> float:
+    """Ask Gemini to rate the reasoning quality of a solution (0.0-1.0).
+
+    Uses JSON schema output for reliable structured responses.
+    """
+    import random
+
+    # Truncate solution to keep within context limits
+    solution_truncated = solution[:6000] if len(solution) > 6000 else solution
+
+    prompt = (
+        f"PROBLEM: {problem}\n"
+        f"SOLUTION: {solution_truncated}\n"
+        f"CORRECT ANSWER: {ground_truth}\n"
+        f"Rate the reasoning quality of this math solution."
+    )
+
     client = _get_gemini_client()
+    safety = _get_safety_settings()
 
     for model_id in GEMINI_MODELS:
         for attempt in range(GEMINI_MAX_RETRIES):
@@ -194,41 +243,55 @@ Respond with ONLY a decimal number between 0.0 and 1.0, nothing else."""
                 response = client.models.generate_content(
                     model=model_id,
                     contents=prompt,
-                    config=types.GenerateContentConfig(
-                        max_output_tokens=16,
-                        temperature=0.0,
-                    ),
+                    config={
+                        "max_output_tokens": 4096,
+                        "temperature": 0.0,
+                        "safety_settings": safety,
+                        "response_mime_type": "application/json",
+                        "response_json_schema": GEMINI_JSON_SCHEMA,
+                    },
                 )
-                # Handle None/empty response (safety filter or empty generation)
-                if response.text is None:
-                    logger.warning(f"Gemini [{model_id}] returned None text (attempt {attempt + 1}/{GEMINI_MAX_RETRIES})")
-                    if attempt < GEMINI_MAX_RETRIES - 1:
-                        time.sleep(GEMINI_RETRY_DELAY * (attempt + 1) + random.uniform(0, 1))
-                    continue
-                text = response.text.strip()
-                if not text:
-                    logger.warning(f"Gemini [{model_id}] returned empty text (attempt {attempt + 1}/{GEMINI_MAX_RETRIES})")
-                    if attempt < GEMINI_MAX_RETRIES - 1:
-                        time.sleep(GEMINI_RETRY_DELAY * (attempt + 1) + random.uniform(0, 1))
-                    continue
-                # Try direct float parse first
+
+                # Try parsed JSON first (most reliable)
+                if response.parsed and isinstance(response.parsed, dict):
+                    score = response.parsed.get("score")
+                    if score is not None:
+                        return max(0.0, min(1.0, float(score)))
+
+                # Fallback: parse text as JSON
+                resp_text = None
                 try:
-                    score = float(text)
-                    return max(0.0, min(1.0, score))
-                except ValueError:
+                    resp_text = response.text
+                except Exception:
                     pass
-                # Extract first number from response text (Gemini sometimes adds explanation)
-                numbers = re.findall(r"(?:^|\s)(0\.\d+|1\.0|0|1)(?:\s|$|[,.])", text)
-                if numbers:
-                    score = float(numbers[0])
-                    return max(0.0, min(1.0, score))
-                logger.warning(f"Gemini [{model_id}] non-numeric response (attempt {attempt + 1}/{GEMINI_MAX_RETRIES}): {text[:80]}")
+
+                if resp_text:
+                    import json
+                    try:
+                        data = json.loads(resp_text)
+                        score = data.get("score")
+                        if score is not None:
+                            return max(0.0, min(1.0, float(score)))
+                    except (json.JSONDecodeError, ValueError):
+                        pass
+                    # Last resort: extract number from text
+                    score = _extract_score(resp_text)
+                    if score is not None:
+                        return score
+
+                # Log failure
+                finish = None
+                if response.candidates:
+                    finish = getattr(response.candidates[0], "finish_reason", None)
+                logger.warning(
+                    f"Gemini [{model_id}] no parseable score, finish_reason={finish} "
+                    f"(attempt {attempt + 1}/{GEMINI_MAX_RETRIES})"
+                )
                 if attempt < GEMINI_MAX_RETRIES - 1:
                     time.sleep(GEMINI_RETRY_DELAY * (attempt + 1) + random.uniform(0, 1))
             except Exception as e:
                 logger.warning(f"Gemini [{model_id}] API error (attempt {attempt + 1}/{GEMINI_MAX_RETRIES}): {e}")
                 if attempt < GEMINI_MAX_RETRIES - 1:
-                    # Exponential backoff with jitter for rate limiting
                     time.sleep(GEMINI_RETRY_DELAY * (2 ** attempt) + random.uniform(0, 2))
         logger.warning(f"Gemini [{model_id}] exhausted retries, falling back to next model")
 

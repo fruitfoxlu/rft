@@ -1,5 +1,5 @@
---- /tmp/openrlhf_pkg/openrlhf_orig/openrlhf-0.9.3.data/purelib/openrlhf/models/actor.py	2026-02-05 12:33:06.000000000 +0000
-+++ /opt/conda/envs/rft/lib/python3.10/site-packages/openrlhf/models/actor.py	2026-02-19 20:58:24.310730182 +0000
+--- a/openrlhf/models/actor.py	2026-02-05 12:33:06.000000000 +0000
++++ b/openrlhf/models/actor.py	2026-02-19 20:58:24.310730182 +0000
 @@ -59,13 +59,6 @@
              # Support multiple attention mechanism implementations
              attn_impl = attn_implementation

@@ -1,5 +1,5 @@
---- /tmp/openrlhf_pkg/openrlhf_orig/openrlhf-0.9.3.data/purelib/openrlhf/trainer/ppo_utils/experience_maker.py	2026-02-05 12:33:06.000000000 +0000
-+++ /opt/conda/envs/rft/lib/python3.10/site-packages/openrlhf/trainer/ppo_utils/experience_maker.py	2026-02-19 21:35:47.880970566 +0000
+--- a/openrlhf/trainer/ppo_utils/experience_maker.py	2026-02-05 12:33:06.000000000 +0000
++++ b/openrlhf/trainer/ppo_utils/experience_maker.py	2026-02-19 21:35:47.880970566 +0000
 @@ -445,16 +445,26 @@
              "truncated": torch.tensor([is_truncated]),
          }

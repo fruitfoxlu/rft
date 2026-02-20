@@ -87,11 +87,14 @@ python -m openrlhf.cli.train_ppo_ray \
     --adam_offload \
     --gradient_checkpointing \
     --gradient_checkpointing_use_reentrant \
-    --gradient_checkpointing_use_reentrant \
     --param_dtype bf16 \
     --actor_learning_rate 1e-6 \
     --save_path "$SAVE_PATH" \
+    --ckpt_path "${SCRIPT_DIR}/ckpt/checkpoints_ppo_ray" \
+    --disable_ds_ckpt \
+    --save_hf_ckpt \
     --save_steps 10 \
+    --max_ckpt_num 2 \
     --logging_steps 1 \
     --vllm_sync_with_ray \
     "$@"

@@ -14,9 +14,18 @@
   gemini-3-pro-preview → gemini-3.1-pro-preview → gemini-3-flash-preview
 
 ## Changes from Attempt 22
-1. Added warm-up broadcast in `ppo_actor.py` after `init_collective_group()` (actor rank 0)
-2. Added warm-up broadcast in `vllm_worker_wrap.py` after `init_collective_group()` (worker ranks)
-3. Updated `reward_func.py` with Gemini model fallback chain
+1. **Ray object store weight sync**: Replaced Ray collective broadcast (which uses NCCL
+   rendezvous that fails between actor and vLLM EngineCore subprocess workers) with
+   Ray object store transfer (ray.put/ray.get). This completely avoids NCCL for weight sync.
+   - `ppo_actor.py`: Actor puts param data into Ray object store, sends ref to engines
+   - `vllm_engine.py`: Added `update_weight_from_ref()` that passes weight_ref via collective_rpc
+   - `vllm_worker_wrap.py`: Added `update_weight_from_ref()` that uses ray.get(weight_ref)
+   - Removed collective group initialization (no longer needed with --vllm_sync_with_ray)
+2. Updated `reward_func.py` with Gemini model fallback chain
+
+## Failed sub-attempts
+- Warm-up broadcast during init_process_group: Same rendezvous.meet() failure
+  (NCCLUniqueIDStore named actor not findable across Ray namespaces)
 
 ## Command
 ```bash

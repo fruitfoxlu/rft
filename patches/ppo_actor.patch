@@ -1,20 +1,22 @@
---- /tmp/openrlhf_pkg/openrlhf_orig/openrlhf-0.9.3.data/purelib/openrlhf/trainer/ray/ppo_actor.py	2026-02-05 12:33:06.000000000 +0000
-+++ /opt/conda/envs/rft/lib/python3.10/site-packages/openrlhf/trainer/ray/ppo_actor.py	2026-02-19 21:23:28.905542002 +0000
-@@ -136,15 +136,36 @@
+--- a/openrlhf/trainer/ray/ppo_actor.py	2026-02-05 12:33:06.000000000 +0000
++++ b/openrlhf/trainer/ray/ppo_actor.py	2026-02-20 03:41:21.395654611 +0000
+@@ -136,15 +136,34 @@
                  )
                  for i, engine in enumerate(self.vllm_engines)
              ]
+-            if use_ray:
+-                import ray.util.collective as collective
 +            # Synchronize CUDA and clear caches before creating sync group
 +            torch.cuda.synchronize()
 +            torch.cuda.empty_cache()
-+
-             if use_ray:
-                 import ray.util.collective as collective
  
-+                print(f"[INFO] Creating Ray collective group: backend={backend}, world_size={world_size}, rank=0")
-                 collective.init_collective_group(world_size=world_size, rank=0, backend=backend, group_name=group_name)
-                 self._model_update_group = group_name
-+                print(f"[INFO] Ray collective group created successfully")
+-                collective.init_collective_group(world_size=world_size, rank=0, backend=backend, group_name=group_name)
+-                self._model_update_group = group_name
++            if use_ray:
++                # With --vllm_sync_with_ray, we use Ray object store for weight
++                # transfer instead of NCCL/collective broadcast. No process group
++                # or collective init needed -- just skip to ray.get(refs).
++                print(f"[INFO] Using Ray object store for actor-vLLM weight sync (no NCCL needed)")
              else:
 +                # Clear any pending CUDA errors before NCCL communicator init.
 +                import ctypes
@@ -37,3 +39,149 @@
  
              ray.get(refs)
  
+@@ -318,25 +337,54 @@
+ 
+         torch.cuda.empty_cache()
+         model = self.actor.model.module
++
++        # ==========================================
++        # FAST PATH: LoRA-only weight sync
++        # Only sync the small LoRA adapter params (~MBs) instead of all
++        # model params (~100s of GBs). Workers apply the LoRA delta on GPU.
++        # ==========================================
++        has_lora = hasattr(model, 'peft_config') or hasattr(model, 'active_adapters')
++        use_ray = getattr(self.strategy.args, "vllm_sync_with_ray", False)
++        if has_lora and use_ray:
++            self._broadcast_lora_to_vllm(model, cache_reset_refs)
++            return
++
+         count, num_params = 0, len(list(model.named_parameters()))
++        # Collect pending refs from async weight updates (Ray path only).
++        # We must NOT call ray.get() inside the per-param loop because with
++        # ZeRO-3, all ranks must participate in AllGather for each parameter.
++        # If rank 0 blocks on ray.get() while other ranks advance to the next
++        # AllGather, the collectives desync and deadlock.
++        pending_ray_refs = []
++        # Keep ObjectRefs alive so the object store doesn't evict data
++        # before LLMRayActors fetch it via ray.get().
++        pending_object_refs = []
+ 
+         def _broadcast_param(param, count, num_params):
+-            use_ray = getattr(self.strategy.args, "vllm_sync_with_ray", False)
+             # Fire all vllm engines for broadcast
+             if torch.distributed.get_rank() == 0:
+                 shape = param.shape if self.strategy.args.zero_stage != 3 else param.ds_shape
+-                refs = [
+-                    engine.update_weight.remote(name, dtype=param.dtype, shape=shape, empty_cache=count == num_params)
+-                    for engine in self.vllm_engines
+-                ]
+ 
+                 if use_ray:
+-                    import ray.util.collective as collective
+-
+-                    collective.broadcast(param.data, 0, group_name=self._model_update_group)
++                    weight_cpu = param.data.cpu()
++                    weight_ref = ray.put(weight_cpu)
++                    ref_bytes = weight_ref.binary()
++                    del weight_cpu
++                    pending_object_refs.append(weight_ref)
++                    for engine in self.vllm_engines:
++                        pending_ray_refs.append(
++                            engine.update_weight_from_ref.remote(
++                                name, dtype=param.dtype, shape=shape,
++                                weight_ref_bytes=ref_bytes, empty_cache=count == num_params,
++                            )
++                        )
+                 else:
++                    refs = [
++                        engine.update_weight.remote(name, dtype=param.dtype, shape=shape, empty_cache=count == num_params)
++                        for engine in self.vllm_engines
++                    ]
+                     self._model_update_group.broadcast(param.data, src=0, stream=torch.cuda.current_stream())
+-                ray.get(refs)
++                    ray.get(refs)
+ 
+         def _handle_cuda_ipc(param, count, num_params):
+             from torch.multiprocessing.reductions import reduce_tensor
+@@ -388,6 +436,81 @@
+                     with deepspeed.zero.GatheredParameters([param], enabled=self.strategy.args.zero_stage == 3):
+                         _handle_cuda_ipc(param, count, num_params)
+ 
++        # Wait for all async weight updates to complete (Ray path).
++        # This is done AFTER the param loop so rank 0 is never blocked
++        # during AllGather operations.
++        if pending_ray_refs:
++            if torch.distributed.get_rank() == 0:
++                print(f"[INFO] Waiting for {len(pending_ray_refs)} async weight updates to vLLM engines...")
++                ray.get(pending_ray_refs)
++                print(f"[INFO] All weight updates completed.")
++                del pending_object_refs  # Release object store refs
++
++        if cache_reset_refs:
++            ray.get(cache_reset_refs)
++        torch.cuda.empty_cache()
++        torch_dist_barrier_and_cuda_sync()
++
++    def _broadcast_lora_to_vllm(self, model, cache_reset_refs):
++        """Fast LoRA weight sync: only transfer adapter params (~MBs).
++
++        Instead of syncing all model params (240 GB for 120B models),
++        only sync requires_grad=True LoRA adapter params (~900 MB).
++        vLLM workers apply the delta: W += scaling * B @ A on GPU.
++        """
++        import time as _time
++
++        # Get LoRA scaling factor from PEFT config
++        scaling = 2.0  # default fallback
++        for obj in [model, getattr(model, 'base_model', None)]:
++            if obj is not None and hasattr(obj, 'peft_config'):
++                cfg = next(iter(obj.peft_config.values()))
++                scaling = float(cfg.lora_alpha) / float(cfg.r)
++                break
++
++        # Collect only requires_grad=True params (LoRA adapters).
++        # All ranks iterate the same params in the same order.
++        # Only rank 0 copies data; other ranks just participate in
++        # GatheredParameters AllGather (required by ZeRO-3).
++        lora_state = {}
++        t0 = _time.monotonic()
++
++        for name, param in model.named_parameters():
++            if not param.requires_grad:
++                continue  # All ranks skip frozen params - no AllGather needed
++
++            with deepspeed.zero.GatheredParameters([param], enabled=self.strategy.args.zero_stage == 3):
++                if torch.distributed.get_rank() == 0:
++                    lora_state[name] = param.data.cpu().clone()
++
++        if torch.distributed.get_rank() == 0:
++            t1 = _time.monotonic()
++            total_bytes = sum(t.numel() * t.element_size() for t in lora_state.values())
++            print(f"[INFO] LoRA sync: collected {len(lora_state)} adapter params "
++                  f"({total_bytes / 1e6:.1f} MB) in {t1 - t0:.1f}s (scaling={scaling})")
++
++            # Single ray.put for all LoRA params (~95 MB fits in object store).
++            # Pass the ObjectRef directly to .remote() — Ray automatically
++            # resolves ObjectRef arguments before the actor method executes,
++            # so the actor receives the deserialized dict. This avoids the
++            # ObjectRef.__await__() hang that occurs with reconstructed refs.
++            lora_ref = ray.put(lora_state)
++            del lora_state
++
++            refs = []
++            for i, engine in enumerate(self.vllm_engines):
++                print(f"[INFO] Dispatching apply_lora_update to engine {i}...", flush=True)
++                refs.append(engine.apply_lora_update.remote(lora_ref, scaling))
++            print(f"[INFO] All {len(refs)} apply_lora_update.remote() calls dispatched.",
++                  flush=True)
++
++            print(f"[INFO] Waiting for {len(refs)} vLLM engines to apply LoRA updates...")
++            ray.get(refs, timeout=600)
++            t2 = _time.monotonic()
++            print(f"[INFO] LoRA weight sync completed in {t2 - t0:.1f}s")
++
++            del lora_ref
++
+         if cache_reset_refs:
+             ray.get(cache_reset_refs)
+         torch.cuda.empty_cache()

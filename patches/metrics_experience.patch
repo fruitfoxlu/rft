@@ -1,0 +1,42 @@
+--- a/openrlhf/trainer/ppo_utils/experience_maker.py	2026-02-20 21:25:31.877225863 +0000
++++ b/openrlhf/trainer/ppo_utils/experience_maker.py	2026-02-20 21:26:00.557203283 +0000
+@@ -734,6 +734,39 @@
+             for experience, group_reward_std in zip(experiences, group_reward_stds):
+                 experience.info["group_reward_std"] = group_reward_std
+ 
++        # === Extended reward distribution stats ===
++        flat_rewards = rewards.flatten()
++        reward_dist_info = {
++            "reward_mean": flat_rewards.mean(),
++            "reward_std": flat_rewards.std(),
++            "reward_min": flat_rewards.min(),
++            "reward_max": flat_rewards.max(),
++            "reward_p90": flat_rewards.quantile(0.9),
++        }
++        # High-reward-but-wrong detection: reward > 0.5 but correctness == 0
++        # Uses per-sample rewards and correctness from experience info
++        try:
++            all_correctness = []
++            for exp in experiences:
++                if "correctness" in exp.info:
++                    c = exp.info["correctness"]
++                    if isinstance(c, torch.Tensor):
++                        all_correctness.append(c)
++                    elif isinstance(c, (list, float, int)):
++                        all_correctness.append(torch.tensor(c, dtype=torch.float))
++            if all_correctness:
++                all_correct = torch.cat([c.flatten() for c in all_correctness])
++                # Map back to sorted order
++                if len(all_correct) == len(flat_rewards):
++                    high_reward_wrong = ((flat_rewards > 0.5) & (all_correct < 0.5)).float().mean()
++                    reward_dist_info["high_reward_but_wrong"] = high_reward_wrong
++        except Exception:
++            pass
++        # Store as per-experience info (will be averaged across micro-batches)
++        for exp in experiences:
++            for k, v in reward_dist_info.items():
++                exp.info[k] = v
++
+         # reward shaping
+         if args.advantage_estimator == "rloo":
+             baseline = (rewards.sum(-1, keepdim=True) - rewards) / (args.n_samples_per_prompt - 1)

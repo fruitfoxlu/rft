@@ -36,10 +36,15 @@ unset GOOGLE_API_KEY GEMINI_API_KEY 2>/dev/null || true
 export NCCL_DEBUG=INFO
 export NCCL_CUMEM_ENABLE=0
 
+# Metrics logging to extra disk space
+export METRICS_LOG_DIR="/mnt/scratch/rft_metrics"
+export SAMPLES_LOG_DIR="/mnt/scratch/rft_samples"
+
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 TRAIN_DATA="${SCRIPT_DIR}/data/train_prompts.jsonl"
+EVAL_DATA="${SCRIPT_DIR}/data/eval_prompts.jsonl"
 REWARD_FUNC="${SCRIPT_DIR}/reward_func.py"
-SAVE_PATH="${SCRIPT_DIR}/output/gpt-oss-120b-grpo"
+SAVE_PATH="/mnt/data/rft_output/gpt-oss-120b-grpo"
 
 if [ ! -f "$TRAIN_DATA" ]; then
     echo "Error: $TRAIN_DATA not found."
@@ -89,12 +94,17 @@ python -m openrlhf.cli.train_ppo_ray \
     --gradient_checkpointing_use_reentrant \
     --param_dtype bf16 \
     --actor_learning_rate 1e-6 \
+    --entropy_loss_coef 0 \
     --save_path "$SAVE_PATH" \
-    --ckpt_path "${SCRIPT_DIR}/ckpt/checkpoints_ppo_ray" \
+    --ckpt_path "/mnt/data/rft_checkpoints/checkpoints_ppo_ray" \
     --disable_ds_ckpt \
     --save_hf_ckpt \
     --save_steps 10 \
-    --max_ckpt_num 2 \
+    --max_ckpt_num 3 \
     --logging_steps 1 \
+    --eval_dataset "$EVAL_DATA" \
+    --eval_steps 10 \
+    --eval_temperature 0.0 \
+    --eval_n_samples_per_prompt 8 \
     --vllm_sync_with_ray \
     "$@"

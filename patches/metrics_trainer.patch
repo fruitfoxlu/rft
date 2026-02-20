@@ -1,0 +1,48 @@
+--- a/openrlhf/trainer/ppo_trainer.py	2026-02-20 21:25:31.877225863 +0000
++++ b/openrlhf/trainer/ppo_trainer.py	2026-02-20 21:26:25.313183794 +0000
+@@ -1,3 +1,4 @@
++import json
+ import os
+ import time
+ from abc import ABC
+@@ -204,6 +205,40 @@
+             if self.tensorboard_logger:
+                 self.tensorboard_logger.log_train(global_step, logs_dict)
+ 
++            # === Detailed JSONL logging to disk ===
++            metrics_dir = os.environ.get("METRICS_LOG_DIR", "")
++            if metrics_dir:
++                os.makedirs(metrics_dir, exist_ok=True)
++                metrics_path = os.path.join(metrics_dir, "training_metrics.jsonl")
++                try:
++                    record = {"global_step": global_step, "timestamp": time.time()}
++                    for k, v in logs_dict.items():
++                        if k == "generated_samples":
++                            continue
++                        if isinstance(v, (int, float)):
++                            record[k] = v
++                        elif isinstance(v, torch.Tensor):
++                            record[k] = v.float().mean().item()
++                    with open(metrics_path, "a") as f:
++                        f.write(json.dumps(record) + "\n")
++                except Exception as e:
++                    logger.warning(f"Failed to write metrics JSONL: {e}")
++
++            # === Sample output logging (every save_steps) ===
++            samples_dir = os.environ.get("SAMPLES_LOG_DIR", "")
++            if samples_dir and global_step % self.args.save_steps == 0:
++                os.makedirs(samples_dir, exist_ok=True)
++                samples = logs_dict.get("generated_samples", [])
++                if samples:
++                    samples_path = os.path.join(samples_dir, f"samples_step{global_step}.jsonl")
++                    try:
++                        with open(samples_path, "w") as f:
++                            for s in samples[:16]:  # Log up to 16 samples
++                                f.write(json.dumps(s, ensure_ascii=False) + "\n")
++                        logger.info(f"Saved {min(len(samples), 16)} sample outputs to {samples_path}")
++                    except Exception as e:
++                        logger.warning(f"Failed to write samples: {e}")
++
+         # save ckpt
+         # TODO: save best model on dev, use loss/perplexity/others on whole dev dataset as metric
+         client_states = client_states or {}

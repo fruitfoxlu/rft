@@ -1,0 +1,35 @@
+--- a/openrlhf/trainer/ray/ppo_actor.py	2026-02-20 21:25:31.873225866 +0000
++++ b/openrlhf/trainer/ray/ppo_actor.py	2026-02-20 21:25:47.149213840 +0000
+@@ -318,6 +318,32 @@
+         status = {"policy_loss": actor_loss.detach().item(), "actor_lr": self.actor_scheduler.get_last_lr()[0]}
+         if self.args.entropy_loss_coef is not None:
+             status["entropy_loss"] = entropy_loss.detach().item()
++            # Entropy distribution stats (token-level)
++            ent = output.entropy[:, -experience.action_mask.shape[1]:]
++            ent_vals = ent[experience.action_mask.bool()].detach()
++            if ent_vals.numel() > 0:
++                status["entropy_mean"] = ent_vals.mean().item()
++                status["entropy_p10"] = ent_vals.quantile(0.1).item()
++                status["entropy_p90"] = ent_vals.quantile(0.9).item()
++
++        # Gradient norm from DeepSpeed engine (cached from step())
++        try:
++            ds_model = self.actor.model
++            if hasattr(ds_model, "get_global_grad_norm"):
++                gn = ds_model.get_global_grad_norm()
++                if gn is not None:
++                    status["grad_norm"] = float(gn)
++        except Exception:
++            pass
++
++        # Advantage stats (per micro-batch)
++        adv_mask = experience.action_mask.bool()
++        adv_vals = advantages[adv_mask].detach().float()
++        if adv_vals.numel() > 0:
++            status["advantage_mean"] = adv_vals.mean().item()
++            status["advantage_std"] = adv_vals.std().item()
++            status["advantage_max"] = adv_vals.max().item()
++            status["advantage_min"] = adv_vals.min().item()
+ 
+         # merge logs from info field
+         for k, v in experience.info.items():

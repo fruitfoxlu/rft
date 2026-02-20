@@ -1,6 +1,6 @@
 --- a/openrlhf/trainer/ppo_utils/experience_maker.py	2026-02-20 21:25:31.877225863 +0000
 +++ b/openrlhf/trainer/ppo_utils/experience_maker.py	2026-02-20 21:26:00.557203283 +0000
-@@ -734,6 +734,39 @@
+@@ -734,6 +734,40 @@
              for experience, group_reward_std in zip(experiences, group_reward_stds):
                  experience.info["group_reward_std"] = group_reward_std
 
@@ -32,10 +32,11 @@
 +                    reward_dist_info["high_reward_but_wrong"] = high_reward_wrong.item()
 +        except Exception:
 +            pass
-+        # Store as per-experience info (plain floats, not tensors)
++        # Store as per-experience info tensors (must match batch_size for replay buffer splitting)
 +        for exp in experiences:
++            bs = exp.sequences.shape[0]
 +            for k, v in reward_dist_info.items():
-+                exp.info[k] = v
++                exp.info[k] = torch.full((bs,), v)
 +
          # reward shaping
          if args.advantage_estimator == "rloo":

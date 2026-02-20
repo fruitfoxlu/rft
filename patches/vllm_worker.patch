@@ -1,0 +1,80 @@
+--- a/openrlhf/trainer/ray/vllm_worker_wrap.py
++++ b/openrlhf/trainer/ray/vllm_worker_wrap.py
+@@ -72,3 +72,75 @@
+         self.model_runner.model.load_weights(weights=[(name, weight)])
+         torch.cuda.synchronize()
++
++    def update_weight_from_ray_ref(self, name, dtype, shape, weight_ref_bytes, empty_cache=False):
++        """Update a single weight from a Ray object store reference."""
++        import ray
++        import torch
++
++        weight_ref = ray.ObjectRef.from_binary(weight_ref_bytes)
++        weight_cpu = ray.get(weight_ref)
++        weight = weight_cpu.to(dtype=dtype, device="cuda")
++        del weight_cpu
++        self.model_runner.model.load_weights(weights=[(name, weight)])
++        del weight
++        if empty_cache:
++            torch.cuda.empty_cache()
++
++    def apply_lora_delta(self, lora_state, scaling):
++        """Apply LoRA weight deltas directly to model parameters.
++
++        For each LoRA pair (lora_A, lora_B), computes:
++            delta = scaling * B @ A
++        and adds it in-place to the corresponding base weight.
++
++        Each TP worker operates on its own shard, so in-place
++        addition of the full delta is correct — the worker's
++        param.data is already the local shard.
++        """
++        import re
++        import torch
++
++        # Group LoRA params by base module
++        lora_a = {}
++        lora_b = {}
++        for name, tensor in lora_state.items():
++            if ".lora_A." in name:
++                base = name.replace(".lora_A.default", "").replace(".lora_A.", ".")
++                lora_a[base] = tensor
++            elif ".lora_B." in name:
++                base = name.replace(".lora_B.default", "").replace(".lora_B.", ".")
++                lora_b[base] = tensor
++
++        applied = 0
++        for base_name in lora_a:
++            if base_name not in lora_b:
++                continue
++            A = lora_a[base_name]
++            B = lora_b[base_name]
++            # Clean PEFT naming to match vLLM param names
++            clean = re.sub(r"^base_model\.model\.", "", base_name)
++            clean = re.sub(r"\.base_layer$", "", clean)
++            # Compute full delta
++            delta = (scaling * (B.float() @ A.float())).to(dtype=torch.bfloat16)
++            # Use load_weights which handles TP sharding
++            self.model_runner.model.load_weights(weights=[(clean, delta.to("cuda"))], add_to_existing=True)
++            applied += 1
++
++        if applied == 0:
++            # Fallback: load_weights may not support add_to_existing
++            # Try in-place addition on matching params
++            for base_name in lora_a:
++                if base_name not in lora_b:
++                    continue
++                A = lora_a[base_name]
++                B = lora_b[base_name]
++                clean = re.sub(r"^base_model\.model\.", "", base_name)
++                clean = re.sub(r"\.base_layer$", "", clean)
++                delta = (scaling * (B.float() @ A.float())).to(dtype=torch.bfloat16).to("cuda")
++                for pname, param in self.model_runner.model.named_parameters():
++                    if pname == clean:
++                        param.data.add_(delta)
++                        applied += 1
++                        break
++                del delta
++
++        torch.cuda.empty_cache()
++        return applied

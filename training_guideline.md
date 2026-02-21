@@ -20,12 +20,16 @@ All project code lives in a single repository:
 |------|---------|
 | `train_grpo_20b.sh` | Training launch script — Attempt 26 config |
 | `train_grpo_20b_a27.sh` | Training launch script — Attempt 27 config (eps_clip=0.1) |
+| `train_grpo_20b_a28a.sh` | A/B experiment — eps_clip=0.2 baseline (200 steps, 400-prompt pool) |
+| `train_grpo_20b_a28b.sh` | A/B experiment — eps_clip=0.1 tighter clipping (200 steps, 400-prompt pool) |
+| `preflight_lr.sh` | Pre-flight LR schedule check — aborts if LR@step20 < 30% target |
 | `reward_func_em.py` | Pure exact-match reward function with diagnostic fields |
 | `prepare_sft_data.py` | NuminaMath-1.5 data filtering and preparation |
 | `apply_patches.sh` | Applies all patches to installed site-packages |
 | `rl_grpo_research.md` | Research log documenting all attempts and findings |
 | `patches/*.patch` | Patches for OpenRLHF and vLLM |
 | `data/sft_rl_pool.jsonl` | RL training data (50k problems) |
+| `data/sft_rl_pool_400.jsonl` | 400-prompt subset for A28 A/B (seed=42, deterministic) |
 | `data/sft_train.jsonl` | SFT data (5k problems, only if needed) |
 | `data/aime_eval.jsonl` | AIME 2024 held-out eval (18 problems) |
 | `data/probe_set_200.jsonl` | ID probe set (200 problems from training pool, seed=42) |
@@ -318,6 +322,14 @@ export METRICS_LOG_DIR="/mnt/scratch/rft_metrics_20b"
 export SAMPLES_LOG_DIR="/mnt/scratch/rft_samples_20b"
 mkdir -p "$METRICS_LOG_DIR" "$SAMPLES_LOG_DIR"
 ```
+
+**IMPORTANT — Pre-flight LR check**: Before any training launch, verify the LR schedule will reach meaningful values within the intended step budget:
+
+```bash
+POOL=$(wc -l < data/sft_rl_pool_400.jsonl) NS=8 TBS=16 EP=1 WARMUP=0.05 LR=5e-7 bash preflight_lr.sh
+```
+
+This models the actual OpenRLHF scheduler (linear warmup + `cosine_with_min_lr`, `min_lr = 0.1 * target_lr`). Aborts if LR@step20 < 30% of target. Total steps = `pool_size * n_samples_per_prompt // train_batch_size * num_episodes`.
 
 Run training with unbuffered output:
 

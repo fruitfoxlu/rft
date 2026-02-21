@@ -1,5 +1,5 @@
 --- openrlhf-0.9.3.data/purelib/openrlhf/trainer/ray/ppo_actor.py	2026-02-05 12:33:06.000000000 +0000
-+++ /opt/conda/envs/rft/lib/python3.10/site-packages/openrlhf/trainer/ray/ppo_actor.py	2026-02-21 17:15:15.396809137 +0000
++++ /opt/conda/envs/rft/lib/python3.10/site-packages/openrlhf/trainer/ray/ppo_actor.py	2026-02-21 20:10:15.012548691 +0000
 @@ -136,15 +136,34 @@
                  )
                  for i, engine in enumerate(self.vllm_engines)
@@ -56,7 +56,7 @@
          if self.args.use_kl_loss:
              if self.args.init_kl_coef > 0:
                  kl = compute_approx_kl(
-@@ -299,6 +328,71 @@
+@@ -299,6 +328,77 @@
          status = {"policy_loss": actor_loss.detach().item(), "actor_lr": self.actor_scheduler.get_last_lr()[0]}
          if self.args.entropy_loss_coef is not None:
              status["entropy_loss"] = entropy_loss.detach().item()
@@ -81,39 +81,45 @@
 +            pass
 +        status["grad_norm"] = grad_norm_val
 +
-+        # Spike logging: dump prompt hashes when grad_norm exceeds threshold
-+        SPIKE_THRESHOLD = 50.0
-+        if grad_norm_val > SPIKE_THRESHOLD and torch.distributed.get_rank() == 0:
++        # Spike logging: dump prompt hashes when ratio tails are extreme.
++        # Trigger on per-micro-batch ratio stats (fresh from current forward pass),
++        # NOT on grad_norm (which is stale from the previous optimizer step).
++        _lr_raw_max = getattr(self.actor_loss_fn, '_log_ratio_raw_max', 0.0)
++        _micro_loss = actor_loss.detach().item()
++        RATIO_SPIKE_THRESHOLD = 5.0   # log_ratio_raw_max > 5 means ratio > 148x
++        LOSS_SPIKE_THRESHOLD = 0.15   # policy_loss > 0.15 (vs normal 0.01-0.03)
++        is_spike = (_lr_raw_max > RATIO_SPIKE_THRESHOLD) or (_micro_loss > LOSS_SPIKE_THRESHOLD)
++        if is_spike and torch.distributed.get_rank() == 0:
 +            try:
 +                import hashlib, json, time as _time
 +                spike_log_path = os.environ.get("SPIKE_LOG_PATH", "/mnt/scratch/rft_metrics_20b/spike_log.jsonl")
-+                # Extract prompt tokens (before action_mask starts) for each sample
-+                # sequences: [batch, seq_len], action_mask: [batch, response_len]
 +                seq = sequences.detach()
 +                prompt_len = seq.shape[1] - action_mask.shape[1]
 +                prompt_hashes = []
 +                for i in range(seq.shape[0]):
 +                    prompt_tokens = seq[i, :prompt_len].cpu().tolist()
-+                    # Remove padding (0s) from the left
 +                    prompt_tokens = [t for t in prompt_tokens if t != 0]
 +                    h = hashlib.sha256(str(prompt_tokens).encode()).hexdigest()[:16]
 +                    prompt_hashes.append(h)
-+                # Deduplicate (all 8 samples from same prompt have same hash)
 +                unique_hashes = list(dict.fromkeys(prompt_hashes))
 +                spike_entry = {
 +                    "timestamp": _time.time(),
-+                    "grad_norm": grad_norm_val,
-+                    "policy_loss": actor_loss.detach().item(),
++                    "trigger": "ratio" if _lr_raw_max > RATIO_SPIKE_THRESHOLD else "loss",
++                    "policy_loss_micro": _micro_loss,
++                    "grad_norm_cached": grad_norm_val,
 +                    "prompt_hashes": unique_hashes,
 +                    "n_samples": seq.shape[0],
 +                    "prompt_len": prompt_len,
-+                    "log_ratio_max": self.actor_loss_fn._log_ratio_max if hasattr(self.actor_loss_fn, '_log_ratio_max') else None,
-+                    "log_ratio_raw_max": self.actor_loss_fn._log_ratio_raw_max if hasattr(self.actor_loss_fn, '_log_ratio_raw_max') else None,
++                    "log_ratio_raw_max": _lr_raw_max,
++                    "log_ratio_raw_min": getattr(self.actor_loss_fn, '_log_ratio_raw_min', None),
++                    "log_ratio_abs_p99": getattr(self.actor_loss_fn, '_log_ratio_abs_p99', None),
++                    "ratio_max": getattr(self.actor_loss_fn, '_ratio_max', None),
++                    "tokens_in_batch": getattr(self.actor_loss_fn, '_tokens_in_batch', None),
 +                }
 +                with open(spike_log_path, "a") as f:
 +                    f.write(json.dumps(spike_entry) + "\n")
-+                print(f"[SPIKE] grad_norm={grad_norm_val:.1f} policy_loss={spike_entry['policy_loss']:.4f} "
-+                      f"prompt_hashes={unique_hashes}", flush=True)
++                print(f"[SPIKE:{spike_entry['trigger']}] lr_raw_max={_lr_raw_max:.2f} loss={_micro_loss:.4f} "
++                      f"prompt={unique_hashes[0] if unique_hashes else '?'}", flush=True)
 +            except Exception as e:
 +                print(f"[WARN] Spike logging failed: {e}", flush=True)
 +
@@ -128,7 +134,7 @@
  
          # merge logs from info field
          for k, v in experience.info.items():
-@@ -318,25 +412,54 @@
+@@ -318,25 +418,54 @@
  
          torch.cuda.empty_cache()
          model = self.actor.model.module
@@ -192,7 +198,7 @@
  
          def _handle_cuda_ipc(param, count, num_params):
              from torch.multiprocessing.reductions import reduce_tensor
-@@ -388,6 +511,81 @@
+@@ -388,6 +517,81 @@
                      with deepspeed.zero.GatheredParameters([param], enabled=self.strategy.args.zero_stage == 3):
                          _handle_cuda_ipc(param, count, num_params)
  

@@ -615,7 +615,8 @@ All patches are in `patches/` and applied via `bash apply_patches.sh`.
 ---
 
 *Last updated: 2026-02-21. Attempt 26 concluded (step 60+, degrading). Step 30 locked as best checkpoint (8/18 AIME).
-Attempt-27 ready: eps_clip 0.1, ratio tail logging, OOD probe eval, spike sample logging.*
+Attempt-27 stopped at step 46 — discovered num_episodes misconfiguration (125K actual steps vs ~40 expected). OOD eval stable (64-69%) but LR was only 5.8% of target. Both A26 and A27 effectively trained at near-zero LR.
+Next: recalibrate step budget and rerun with correct schedule.*
 
 ---
 
@@ -1023,7 +1024,7 @@ All other training hyperparameters are identical to attempt-26. Instrumentation-
 | `eval metric` | `nondet_proxy_pass@8` | `greedy_pass@1` | Instrumentation |
 | `eval_steps` | 10 | 5 | Instrumentation |
 | `save_steps` | 10 | 5 | Instrumentation |
-| `num_episodes` | 20 | 5 (~40 steps) | Instrumentation |
+| `num_episodes` | 20 | 5 (125K actual steps — see §11.13) | Instrumentation |
 
 **Eval schedule**:
 - **Built-in** (every 5 steps): `greedy_pass@1` on OOD probe (202 MATH+Apex problems, `temp=0, n=1`)
@@ -1081,6 +1082,8 @@ All other training hyperparameters are identical to attempt-26. Instrumentation-
 
 12. **The training horizon is shorter than you think**: With LoRA rank=32, LR=5e-7, and 50k training problems, the best checkpoint was at step 30 (~3 episodes through the data). Steps 40-50 showed declining generalization despite improving training metrics. Over-training LoRA adapters is easy — they have limited capacity and quickly memorize the training distribution. Plan for ~30-step runs and evaluate frequently.
 
+13. **Understand `num_episodes` before launching**: In OpenRLHF, `total_steps = len(prompts) * n_samples_per_prompt // train_batch_size * num_episodes * max_epochs`. With 50K prompts, `n_samples=8`, `train_batch=16`, and `num_episodes=5`, this yields **125,000 steps** — not ~40. The LR warmup (5% of total = 6,250 steps) means the model barely trains in the first 50 steps. Both A26 and A27 were effectively at near-zero LR for their entire observed runs. Always compute `max_steps` before launching and verify the LR schedule reaches meaningful values within your intended step budget.
+
 ### 11.12 Theory: Why Gradient Spikes Escalate
 
 Based on attempt-26 data (52 steps), we propose the following mechanism for escalating gradient norm spikes in GRPO with LoRA:
@@ -1113,3 +1116,135 @@ Based on attempt-26 data (52 steps), we propose the following mechanism for esca
 **Interventions that do NOT help**:
 - **Advantage clipping**: Advantages are identical at spike and non-spike steps. The problem is the ratio, not the advantage.
 - **Larger batch size** (without per-micro-batch clipping): More micro-batches dilute the extreme one, but with `micro_train_batch_size=1` and gradient accumulation, the extreme prompt's gradient is still fully computed and accumulated before clipping.
+
+### 11.13 Attempt-27 Results
+
+**Run parameters**: eps_clip=0.1 (single variable change from A26), OOD probe eval (greedy_pass@1), eval_steps=5.
+
+**Critical finding — `num_episodes` misconfiguration**:
+The `num_episodes=5` parameter with 50K prompts in `sft_rl_pool.jsonl` computes to:
+
+```
+max_steps = len(prompts) * n_samples_per_prompt // train_batch_size * num_episodes * max_epochs
+         = 50000 * 8 // 16 * 5 * 1
+         = 125,000 steps
+```
+
+The original estimate of "~40 steps" was incorrect. With `lr_warmup_ratio=0.05`, warmup alone is 6,250 steps. At step 46, the LR was at 2.91e-8 — only 5.8% of the target 5e-7. The model was effectively training at near-zero LR for the entire observed run. Run was manually stopped at step 46.
+
+**Note**: Attempt-26 also had this misconfiguration (num_episodes=20 with same 50K pool → 500,000 total steps, stopped manually at step 60). Both A26 and A27's results should be interpreted as very-early-training behavior.
+
+**OOD Eval trajectory (greedy_pass@1 on 202 MATH+Apex problems)**:
+
+| Step | OOD greedy_pass@1 | Notes |
+|------|-------------------|-------|
+| 5    | 65.72% | |
+| 10   | 65.84% | |
+| 15   | 64.17% | |
+| 20   | 66.52% | |
+| 25   | 65.97% | |
+| 30   | 64.17% | |
+| 35   | **68.87%** | Best |
+| 40   | **68.87%** | Best (tie) |
+| 45   | 65.84% | |
+
+**Key metrics table** (selected steps):
+
+| Step | policy_loss | grad_norm | ratio_max | p99 | correct | Notes |
+|------|------------|-----------|-----------|-----|---------|-------|
+| 1    | 0.053 | 10.6 | 74 | 1.96 | 0.602 | |
+| 9    | 0.286 | 294.1 | 822 | 1.92 | 0.570 | **SPIKE** |
+| 15   | 0.017 | 4.2 | 947 | 2.01 | 0.633 | |
+| 21   | 0.130 | 232.9 | 247 | 2.23 | 0.609 | **SPIKE** |
+| 23   | 0.027 | 14.4 | 1043 | 1.90 | 0.531 | Highest ratio_max |
+| 35   | 0.013 | 3.1 | 309 | 1.72 | 0.672 | Best eval step |
+| 40   | 0.280 | 139.7 | 2112 | 1.58 | 0.414 | **SPIKE** + highest ratio |
+| 41   | 0.043 | 171.4 | 97 | 1.93 | 0.492 | Residual from step 40 |
+| 46   | 0.018 | 3.0 | 34 | 1.72 | 0.680 | |
+
+**LR progression** (all values from warmup phase):
+- Step 1: 3.0e-10, Step 10: 6.1e-9, Step 20: 1.2e-8, Step 30: 1.9e-8, Step 40: 2.5e-8, Step 46: 2.9e-8
+
+**Spike log analysis**: 60 entries, all with identical prompt hash `2f444de84f582bf0` — confirms timing bug (grad_norm trigger fires on wrong micro-batch). Bug was fixed for future runs (trigger on per-micro-batch log_ratio_raw_max > 5.0 or policy_loss > 0.15 instead).
+
+**Observations**:
+
+1. **OOD eval stable**: No degradation trend through 46 steps (range: 64.2%–68.9%). This contrasts with A26's degradation (44.4% → 27.8% on AIME). However, interpretation is limited because the LR was near-zero — the model barely changed from the SFT baseline.
+
+2. **Spikes still occur at near-zero LR**: Major spikes at steps 9 (grad=294), 21 (grad=233), 40 (grad=140) despite LR being <3e-8. The ratio_max values (822, 247, 2112) are comparable to A26 but occur at 50x lower LR. This suggests the spike mechanism operates even with minimal policy drift.
+
+3. **log_ratio_abs_p99 stable**: Consistently in 1.6–2.2 range across all steps. The mass of the ratio distribution is well-behaved; spikes are driven by extreme outlier tokens in the tail.
+
+4. **eps_clip=0.1 effect unclear**: Can't isolate the eps_clip effect from the LR effect. Both A26 and A27 were in early warmup when evaluated. A clean comparison requires matching LR schedules or running to similar effective training budgets.
+
+**Checkpoints saved**: Steps 5, 10, 15, 20, 25, 30, 35, 40 at `/mnt/data/rft_checkpoints/gpt-oss-20b-grpo-a27/`
+
+**Implication for future attempts**: The `num_episodes` parameter must be calibrated to the dataset size. With 50K prompts:
+- For ~40 steps: need `num_episodes=1` + limit rollouts, or use a smaller subset
+- For a proper training run: need to decide on a target step count and set episodes accordingly
+- Formula: `total_steps = pool_size * n_samples // train_batch_size * num_episodes`
+
+### 11.14 Spike Log Bug Fix
+
+**Bug**: The original spike logging triggered on `grad_norm > 50`. DeepSpeed's `get_global_grad_norm()` returns a stale value from the previous optimizer step. This caused:
+1. All spike entries had the same prompt hash (`2f444de84f582bf0`) — the hash of the first micro-batch of the step AFTER the spike
+2. `training_metrics` grad_norm is the AVERAGE across 32 micro-batches, while spike_log grad_norm is the per-micro-batch value from DeepSpeed cache — explaining the discrepancy (spike_log shows 2334 vs training_metrics shows 294 for the same step)
+
+**Fix** (applied to installed `ppo_actor.py`, regenerated `ppo_actor.patch`):
+- Trigger on per-micro-batch `log_ratio_raw_max > 5.0` (ratio > 148x) or `policy_loss > 0.15` (vs normal 0.01–0.03)
+- These values are fresh from the current forward pass, so the prompt hash correctly identifies the triggering micro-batch
+- Records `trigger` field ("ratio" or "loss") for diagnostics
+- Fix takes effect in next training run (A28+); A27 used the old trigger
+
+### 11.15 Attempt 28 A/B Design: eps_clip Comparison
+
+**Goal**: Clean A/B comparison of `eps_clip=0.2` (default) vs `eps_clip=0.1` (tighter clipping) with a correct LR schedule that actually reaches meaningful values.
+
+**Root cause of A26/A27 failure**: `num_episodes` with 50K prompts produced 125K–500K total steps. With `lr_warmup_ratio=0.05`, warmup was 6,250–25,000 steps. Runs were stopped at step 46–60 — still in early warmup at <6% of target LR. No meaningful training occurred.
+
+**Fix**: Use a 400-prompt subset (`sft_rl_pool_400.jsonl`) with `num_episodes=1` to yield exactly 200 steps. Warmup is 10 steps (5%), reaching 100% of target LR by step 10.
+
+**Scripts**: `train_grpo_20b_a28a.sh` (eps_clip=0.2), `train_grpo_20b_a28b.sh` (eps_clip=0.1)
+
+**Pre-flight check**: `preflight_lr.sh` runs before each launch and aborts if LR@step20 < 30% of target.
+
+| Parameter | 28A | 28B | Notes |
+|-----------|-----|-----|-------|
+| `eps_clip` | **0.2** | **0.1** | Only training variable |
+| `prompt_data` | pool_400 | pool_400 | Same 400 prompts, seed=42 |
+| `num_episodes` | 1 | 1 | = 200 steps |
+| `seed` | 42 | 42 | Fixed for reproducibility |
+| `actor_learning_rate` | 5e-7 | 5e-7 | |
+| `lr_warmup_ratio` | 0.05 | 0.05 | = 10 warmup steps |
+| `eval_steps` | 10 | 10 | |
+| `save_steps` | 10 | 10 | |
+| `eval_dataset` | OOD (202) | OOD (202) | greedy_pass@1 |
+
+**LR schedule** (both runs identical):
+```
+step   1:  10% of target
+step  10: 100% of target (peak)
+step  50:  91% of target
+step 100:  59% of target
+step 150:  25% of target
+step 200:  10% of target (min_lr)
+```
+
+**Pool subset provenance**:
+- Source: `sft_rl_pool.jsonl` (50K prompts)
+- Selection: reservoir sampling, seed=42, k=400, sorted by SHA-256
+- SHA256: `1d09bb26d12774ea770b304bed08b329ca7629c8344dd67dd9f4f7b64e930a0b`
+- Verified: 0 overlap with OOD probe (202) and AIME eval (18)
+
+**Success criteria**:
+1. LR reaches >90% of target by step 10 (verified by preflight)
+2. Both runs complete 200 steps without crashes
+3. OOD eval shows measurable difference between eps_clip=0.2 vs 0.1
+4. Spike pattern (frequency, magnitude) differs between runs
+5. If OOD degrades in either run, compare degradation onset step
+
+**Output paths**:
+- 28A: `/mnt/data/rft_checkpoints/gpt-oss-20b-grpo-a28a/`, `/mnt/scratch/rft_metrics_20b_a28a/`
+- 28B: `/mnt/data/rft_checkpoints/gpt-oss-20b-grpo-a28b/`, `/mnt/scratch/rft_metrics_20b_a28b/`
+
+**Run order**: Sequential (not parallel — only 8 GPUs). Run 28A first, then 28B.

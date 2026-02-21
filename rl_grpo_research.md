@@ -1039,6 +1039,14 @@ All other training hyperparameters are identical to attempt-26. Instrumentation-
 - Metrics: `/mnt/scratch/rft_metrics_20b_a27/training_metrics.jsonl`
 - Spike log: `/mnt/scratch/rft_metrics_20b_a27/spike_log.jsonl`
 
+**Provenance**:
+- Git commit: `e734d56` (branch: `attempt-26-grpo-20b-em`)
+- Key patch SHAs (sha256):
+  - `ratio_logging_loss.patch`: `3f84df906ac7...`
+  - `ppo_actor.patch`: `0acfe5d0270e...`
+- OpenRLHF version: 0.9.3
+- vLLM version: 0.15.1
+
 ### 11.11 Lessons Learned (Shareable)
 
 **For others doing GRPO RL fine-tuning with MoE models:**

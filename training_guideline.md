@@ -18,15 +18,18 @@ All project code lives in a single repository:
 
 | File | Purpose |
 |------|---------|
-| `train_grpo_20b.sh` | Main training launch script (gpt-oss-20b) |
-| `reward_func_em.py` | Pure exact-match reward function |
+| `train_grpo_20b.sh` | Training launch script — Attempt 26 config |
+| `train_grpo_20b_a27.sh` | Training launch script — Attempt 27 config (eps_clip=0.1) |
+| `reward_func_em.py` | Pure exact-match reward function with diagnostic fields |
 | `prepare_sft_data.py` | NuminaMath-1.5 data filtering and preparation |
 | `apply_patches.sh` | Applies all patches to installed site-packages |
 | `rl_grpo_research.md` | Research log documenting all attempts and findings |
 | `patches/*.patch` | Patches for OpenRLHF and vLLM |
 | `data/sft_rl_pool.jsonl` | RL training data (50k problems) |
 | `data/sft_train.jsonl` | SFT data (5k problems, only if needed) |
-| `data/aime_eval.jsonl` | AIME 2024 evaluation set (18 problems) |
+| `data/aime_eval.jsonl` | AIME 2024 held-out eval (18 problems) |
+| `data/probe_set_200.jsonl` | ID probe set (200 problems from training pool, seed=42) |
+| `data/probe_set_200_ood.jsonl` | OOD probe set (170 MATH + 32 Apex, disjoint from training) |
 
 **Rules:**
 
@@ -107,7 +110,7 @@ This script automatically finds the installed `openrlhf` site-packages directory
 | Patch | Target | What It Does |
 |-------|--------|-------------|
 | `actor.patch` | `openrlhf/models/actor.py` | Adds MXFP4 dequantization support (detects `quant_method=mxfp4` in model config, applies `Mxfp4Config(dequantize=True)`). Delays DeepSpeed ZeRO-3 init until after model loading. Forces `device_map="cpu"` for MXFP4+ZeRO-3 to prevent GPU OOM. |
-| `ppo_actor.patch` | `openrlhf/trainer/ray/ppo_actor.py` | Adds CUDA synchronization before NCCL group init to prevent stale CUDA errors. Implements Ray object store weight sync path (`--vllm_sync_with_ray`). Adds fast LoRA-only weight sync (`_broadcast_lora_to_vllm`) that transfers only adapter params (~96 MB) instead of all model params. |
+| `ppo_actor.patch` | `openrlhf/trainer/ray/ppo_actor.py` | Adds CUDA synchronization before NCCL group init to prevent stale CUDA errors. Implements Ray object store weight sync path (`--vllm_sync_with_ray`). Adds fast LoRA-only weight sync (`_broadcast_lora_to_vllm`) that transfers only adapter params (~96 MB) instead of all model params. Reads ratio tail diagnostics from PolicyLoss and logs to metrics. Dumps prompt hashes to `spike_log.jsonl` when `grad_norm > 50`. |
 | `experience_maker.patch` | `openrlhf/trainer/ppo_utils/experience_maker.py` | Filters `extra_logs` to only `int`/`float` values before converting to `torch.tensor()`. Prevents crashes from string values in logging pipelines. Wraps reward/score conversion in try/except. |
 | `save_model.patch` | `openrlhf/utils/deepspeed/deepspeed.py` | Cleans up full-model shard files (`pytorch_model-*.bin`, `model-*.safetensors`) after LoRA save. PeftModel + ZeRO-3 incorrectly writes ~203 GB of shard files alongside the ~91 MB adapter. Also wires the `--offload` CLI flag to the DeepSpeed train config. |
 | `offload_cli.patch` | `openrlhf/cli/train_ppo_ray.py` | Adds `--offload` argument to the CLI for CPU parameter offloading with ZeRO-3. |
@@ -254,6 +257,7 @@ Start with conservative hyperparameters and tune gradually. Change one variable 
 | `--rollout_batch_size` | `16` | `8` | Number of prompts per rollout. Total samples = rollout_batch_size x n_samples_per_prompt. |
 | `--train_batch_size` | `16` | `8` | Full training batch size (in prompts). |
 | `--micro_train_batch_size` | `1` | `1` | Gradient accumulation. Effective accumulation steps = train_batch_size / micro_train_batch_size. |
+| `--eps_clip` | `0.1` | `0.1` | PPO ratio clipping range [1-eps, 1+eps]. Lower = more conservative updates. Attempt-26 used 0.2 (default), attempt-27 tightened to 0.1 to reduce gradient spikes from extreme log-probability ratios. |
 | `--generate_max_len` | `4096` | `3072` | Max tokens for generation. Increase if truncation rate >70%. |
 | `--prompt_max_len` | `1024` | `1024` | NuminaMath prompts are short (p99.5 = 354 tokens). |
 | `--lr_warmup_ratio` | `0.05` | `0.03` | Fraction of total steps used for LR warmup. |
@@ -287,7 +291,7 @@ Start with conservative hyperparameters and tune gradually. Change one variable 
 | Flat learning | KL tiny, entropy stable, reward/correctness flat | Increase LR, decrease KL coef, increase group size |
 | Instability | KL spikes, entropy drops, correctness worsens | Decrease LR, increase KL coef, add grad clipping |
 | Reward hacking | Reward up but eval correctness flat or down | Reweight reward toward correctness, add judge redundancy |
-| Loss spikes | Rare huge `act_loss` values (e.g., 2.69 vs normal 0.1) | Lower LR, add advantage clipping, increase batch size |
+| Loss/grad spikes | `policy_loss` 3-10x normal, `grad_norm` 100-400x `max_norm` | Root cause is **extreme log-probability ratios** (policy shifted far from reference on specific tokens), NOT advantage outliers. Fix: tighten `eps_clip` (0.2→0.1), add log-ratio clamping, or lower LR. Advantage clipping does NOT help. See `rl_grpo_research.md` Section 11.12 for theory. |
 | Length collapse | Response length drops sharply | Add length penalty, check entropy, add KL constraint |
 | High truncation | >70-80% responses truncated | Increase `--generate_max_len` or add length penalty in reward |
 
@@ -301,6 +305,7 @@ Start with conservative hyperparameters and tune gradually. Change one variable 
 |----------|---------|
 | `$METRICS_LOG_DIR` (`/mnt/scratch/rft_metrics_20b/`) | `training_metrics.jsonl` -- per-step training metrics |
 | `$SAMPLES_LOG_DIR` (`/mnt/scratch/rft_samples_20b/`) | `samples_stepN.jsonl` -- model output samples every `save_steps` |
+| `$SPIKE_LOG_PATH` (`$METRICS_LOG_DIR/spike_log.jsonl`) | Per-spike prompt hashes, grad_norm, ratio stats (when `grad_norm > 50`) |
 | `/mnt/scratch/train_20b.log` | Full stdout/stderr training log |
 | `/var/tmp/ray/session_*/logs/` | Ray worker logs (actor, vLLM engines) |
 
@@ -340,6 +345,10 @@ PYTHONUNBUFFERED=1 bash train_grpo_20b.sh 2>&1 | tee /mnt/scratch/train_20b.log
 | `ppo_clip_ratio` | Fraction of clipped policy updates | >40% = very aggressive updates |
 | `advantage_mean` / `advantage_std` | Advantage distribution | std near 0 within micro-batch is expected with micro_train_batch_size=1 |
 | `entropy_mean` | Token-level entropy | Dropping below 1.0 signals diversity collapse |
+| `log_ratio_raw_max` | Max log(π/π_ref) before clamping | >5 = tokens where policy diverged significantly from reference |
+| `log_ratio_max` | Max log(π/π_ref) after [-20,20] clamp | Difference from raw_max indicates clamping is active |
+| `ratio_max` | Max exp(log_ratio) | >10 = extreme importance sampling ratio |
+| `log_ratio_abs_p99` | 99th percentile of |log_ratio| | Tracks the distribution tail, not just the single max |
 
 **Tier 3 -- Collapse Detection:**
 
@@ -351,14 +360,26 @@ PYTHONUNBUFFERED=1 bash train_grpo_20b.sh 2>&1 | tee /mnt/scratch/train_20b.log
 
 ### Evaluation Metrics
 
-- **Primary eval**: AIME 2024 (18 problems)
-  - `greedy_pass@1`: temperature=0.0, n=1 (fast, deterministic)
-  - `maj@8_sampling`: temperature=0.6, n=8, majority vote (more reliable)
-  - **Do not combine temp=0 with n>1** — greedy produces identical samples, wasting compute
-- **Secondary eval**: MATH45 (fixed 45-problem subset), exact match accuracy
-- **Debug eval**: MATH18_debug (fast sanity subset, for iteration)
-- Evaluated every 10 training steps via `--eval_steps 10`
-- Always report which eval mode was used; do not compare greedy_pass@1 with maj@8_sampling
+**Three eval modes** (never conflate — always label which was used):
+
+| Metric Name | Temp | n | What It Measures | Use Case |
+|-------------|------|---|------------------|----------|
+| `greedy_pass@1` | 0.0 | 1 | Deterministic single-sample accuracy | Fast checkpoint comparison (primary) |
+| `sampling_pass@8` | 0.6 | 8 | Majority-vote accuracy with diversity | More reliable final evaluation |
+| `nondet_proxy_pass@8` | 0.0 | 8 | vLLM batching nondeterminism | Diagnostics only (gap vs greedy_pass@1 = fragile solutions) |
+
+**Eval datasets** (three levels):
+
+| Dataset | Size | Type | Purpose |
+|---------|------|------|---------|
+| `probe_set_200_ood.jsonl` | 202 | OOD (MATH+Apex) | Primary generalization signal, checkpoint selection |
+| `probe_set_200.jsonl` | 200 | ID (from training pool) | Stability / early stopping signal |
+| `aime_eval.jsonl` | 18 | OOD (AIME 2024) | Sanity check only (too small for trends: 1 problem = 5.6%) |
+
+- **Built-in eval** (automatic, every `--eval_steps`): Use OOD probe with `greedy_pass@1`
+- **Post-hoc eval** (manual, on saved checkpoints): AIME + ID probe
+- **Early stopping**: If OOD `greedy_pass@1` drops for 2 consecutive evals
+- Always report which eval mode and dataset was used; never compare metrics across different modes
 
 ### Checking Logs
 
@@ -448,28 +469,23 @@ python prepare_sft_data.py --sft-size 5000 --rl-pool-size 50000 --seed 42
 - **Dataset**: 18 AIME 2024 problems (held out from training)
 - **Frequency**: Every 10 training steps (`--eval_steps 10`)
 
-**Two eval modes** (do not mix):
-
-| Mode | Temperature | n | Metric | Use Case |
-|------|-------------|---|--------|----------|
-| `greedy_pass@1` | 0.0 | 1 | Deterministic single-sample accuracy | Fast checkpoint comparison |
-| `maj@8_sampling` | 0.6 | 8 | Majority vote accuracy | More reliable final evaluation |
-
-**Current run** uses `temp=0.0, n=8`, which is equivalent to `greedy_pass@1` (all 8 samples are identical with greedy decoding). Future runs should use one of the two modes above.
+**Eval configs** (see Section 7 for the full three-metric framework):
 
 ```bash
-# Recommended: greedy_pass@1 (fast, deterministic)
---eval_dataset data/aime_eval.jsonl \
---eval_steps 10 \
+# Recommended: OOD probe with greedy_pass@1 (fast, deterministic, primary for checkpointing)
+--eval_dataset data/probe_set_200_ood.jsonl \
+--eval_steps 5 \
 --eval_temperature 0.0 \
 --eval_n_samples_per_prompt 1
 
-# Alternative: maj@8_sampling (more reliable)
+# Alternative: AIME with sampling_pass@8 (for final checkpoint comparison)
 --eval_dataset data/aime_eval.jsonl \
 --eval_steps 10 \
 --eval_temperature 0.6 \
 --eval_n_samples_per_prompt 8
 ```
+
+**Do not combine temp=0 with n>1** — greedy produces near-identical samples, wasting compute. Attempt-26 used temp=0/n=8 (`nondet_proxy_pass@8`) which was confusing. Future runs use `greedy_pass@1` for built-in eval.
 
 ### Secondary Evaluation: MATH Subset
 
@@ -533,11 +549,9 @@ The reward function returns `extra_logs` with:
 - `correctness`: 1.0 or 0.0
 - `has_answer`: 1.0 if an answer was extracted, 0.0 if empty
 - `has_boxed`: 1.0 if `\boxed{}` was found in the response
-
-**Recommended additions** (implement when needed for debugging):
-- `parse_method`: "boxed" | "last_number" | "none" -- how the answer was extracted
-- `boxed_location`: fraction (0.0-1.0) indicating where `\boxed{}` appears in the response (early = suspicious)
-- `truncated`: 1.0 if response hit `generate_max_len` token limit
+- `parse_method`: 2.0=boxed, 1.0=last_number fallback, 0.0=none (numeric for tensor compatibility — the experience_maker drops string values)
+- `boxed_in_final`: 1.0 if last `\boxed{}` is in the final 20% of the response, 0.0 otherwise
+- `truncated_response`: 1.0 if response appears truncated (heuristic: long + no boxed, or ends mid-sentence)
 
 ### Why Pure EM (Not LLM Judge)
 
@@ -681,16 +695,19 @@ If EM RL shows no improvement after 5 episodes (not 20 -- check sooner for LR tu
 5. **Increase LR**: From 5e-7 to 1e-6, then to 2e-6 if still flat.
 6. **Add quality signal**: Use Gemini to score reasoning quality on correct-only answers.
 
-### Monitoring for Reward Hacking
+### Monitoring for Overfitting / Reward Hacking
 
-Reward hacking = reward increases but eval performance does not.
+**Train/eval divergence** = training correctness improves but held-out eval degrades. This is the primary signal to stop training.
 
 Signs to watch for:
+- Training correctness rolling average trending up while OOD probe `greedy_pass@1` is flat or declining.
 - `reward_mean` trending up but AIME eval score flat or declining.
 - `high_reward_but_wrong` rate increasing (only relevant with LLM judge, not pure EM).
-- Training correctness increasing but eval correctness not (overfitting to training distribution).
+- Gradient norm spikes escalating over time (max per decade increasing = policy drifting into unstable regions).
 
-Response: Compare training correctness trends against held-out eval. If they diverge, the model is likely overfitting to the training data distribution rather than learning generalizable math reasoning.
+**Attempt-26 example**: Training correctness improved (rolling avg 0.51 → 0.56) while AIME pass@1 degraded (35.4% peak at step 20 → 27.1% at step 50, below pre-training baseline). An ID-only probe set would have missed this divergence — the OOD probe is essential.
+
+Response: Use separate ID and OOD probe sets. If OOD probe drops for 2 consecutive evals, stop training. The best checkpoint is usually earlier than you think (attempt-26 peaked at step 30 out of 60+).
 
 ---
 

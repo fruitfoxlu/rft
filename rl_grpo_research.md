@@ -20,8 +20,8 @@
 │  └──────────┬───────────┘    └──────────────┬───────────────────┘  │
 │             │                                │                      │
 │             │ ◄── LoRA weight sync ──────────┘                      │
-│             │     (Ray object store,                                │
-│             │      ~96 MB, ~6s)                                     │
+│             │     (collective_rpc delta,                            │
+│             │      ~96 MB, ~18s)                                    │
 │             │                                                       │
 │             ▼                                                       │
 │  ┌──────────────────────┐    ┌──────────────────────────────────┐  │
@@ -39,7 +39,7 @@
 |----------|--------|-----|
 | RL algorithm | GRPO (dr_grpo) | Group-relative advantages; no critic model needed |
 | KL coefficient | 0 | Maximizes learning signal; risky for stability |
-| Weight sync | Ray object store | NCCL rendezvous fails between actor and vLLM EngineCore subprocess |
+| Weight sync | LoRA delta via collective_rpc | NCCL rendezvous fails; ray.get() deadlocks in compiled DAG; Ray object store used for transfer, collective_rpc for dispatch |
 | Param offload | CPU (ZeRO-3) | 234GB dequantized model / 4 GPUs = 58.5 GB/GPU; no room for activations |
 | Grad checkpointing | Reentrant | Non-reentrant validates tensor shapes; ZeRO-3 offload changes shapes |
 | Checkpoint format | LoRA-only (HF) | Full-model save was 203 GB; adapter_model.bin is 91 MB |
@@ -136,20 +136,37 @@ reasoning_quality:  Gemini 3 Pro rates solution quality on [0, 1] scale
   Correctness dropped to 9.4-14.1% at steps 16-17 once LR hit peak — could not
   diagnose root cause without gradient norms or advantage stats. Stopped to add monitoring.
 
-### Attempt 25: Enhanced metrics + held-out eval (CURRENT)
-- **Problem**: Attempt 24 showed loss spikes (act_loss=2.69) and sudden correctness
-  drops (step 16: 9.4%) without diagnostic data to determine if these were random
-  bad batches, LR-shock, or systematic instability
-- **Fix**: Added 3 new patches for comprehensive monitoring:
-  - `metrics_actor.patch`: gradient norm, advantage stats, entropy distribution
-  - `metrics_experience.patch`: reward distribution, high-reward-but-wrong detection
-  - `metrics_trainer.patch`: per-step JSONL to /mnt/scratch, sample output logging
+### Attempt 25: Enhanced metrics + LoRA weight sync rewrite (CURRENT)
+- **Problem 1**: Attempt 24 lacked diagnostic metrics (no grad norms, advantage stats)
+- **Problem 2**: LoRA weight sync from actor→vLLM required 4 sub-attempts to fix:
+  - **Sub-attempt A**: `ray.get()` inside vLLM compiled DAG worker → **deadlock**.
+    vLLM v1 with Ray TP uses compiled DAGs; `ray.get()` blocks the DAG worker thread.
+  - **Sub-attempt B**: Pass lora_state directly through `collective_rpc` → **crash**.
+    `ValueError: too many dimensions 'str'`. vLLM's msgspec serializer converts
+    torch tensors to string representations, not lists.
+  - **Sub-attempt C**: Convert tensors to `(shape, dtype, list)` tuples before
+    `collective_rpc`, reconstruct on worker side → **crash**. `TypeError:
+    load_weights() got an unexpected keyword argument 'add_to_existing'`. GptOss
+    model doesn't support `add_to_existing=True`.
+  - **Sub-attempt D (working)**: Use save-load-add pattern for TP-safe delta
+    application. Save `param.data.clone()`, call `load_weights(delta)` to correctly
+    shard for TP, then `param.data.add_(saved)`. **Success — 18s sync time.**
+- **Fixes applied**:
+  - 3 new metrics patches (grad norm, advantage stats, reward distribution, JSONL)
+  - 2 new vLLM patches: `vllm_engine.patch` + `vllm_worker.patch` (LoRA sync)
   - Built-in held-out eval every 10 steps via `--eval_dataset`
   - Entropy logging via `--entropy_loss_coef 0`
-  - Checkpoints/output on /mnt/data (1TB), metrics on /mnt/scratch (5.9TB)
-- **Lesson**: **Instrument before you train.** Without grad norms, advantage stats,
-  and held-out eval, you can observe problems but not diagnose them.
-- **Status**: Starting...
+- **Lessons**:
+  - **vLLM compiled DAGs prohibit `ray.get()` inside workers.** Must pass data
+    through `collective_rpc` args, not via Ray object store indirection.
+  - **msgspec (vLLM's serializer) cannot handle torch tensors.** Must convert to
+    primitive types: `(list(shape), str(dtype), tensor.tolist())`.
+  - **Not all vLLM models support `load_weights(add_to_existing=True)`.** The
+    save-load-add pattern is universally compatible with TP sharding.
+  - **Instrument before you train.** Without grad norms, advantage stats,
+    and held-out eval, you can observe problems but not diagnose them.
+- **Status**: Running. Steps 1-2 completed successfully. Episode 1/50 in progress.
+  LoRA weight sync working reliably at 18s per sync.
 
 ### Summary: What Broke and What Fixed It
 
@@ -160,6 +177,9 @@ reasoning_quality:  Gemini 3 Pro rates solution quality on [0, 1] scale
 | Backward shape error | Non-reentrant checkpointing + ZeRO-3 | `--gradient_checkpointing_use_reentrant` | 21→22 |
 | NCCL rendezvous timeout | Ray actor→vLLM subprocess boundary | Ray object store sync | 22→23 |
 | Disk full (422 GB) | PeftModel + ZeRO-3 shard leak | Patch save_model + `--disable_ds_ckpt` | 23→24 |
+| LoRA sync deadlock | `ray.get()` inside compiled DAG worker | Pass data via `collective_rpc` args instead | 25 |
+| Tensor serialization | msgspec can't serialize torch.Tensor | Convert to `(shape, dtype_str, list)` tuples | 25 |
+| `load_weights(add_to_existing)` | Not supported by GptOss model | Save-load-add pattern: clone param, load delta, add back | 25 |
 
 ---
 
@@ -216,18 +236,198 @@ At step 11, a loss spike appeared: `act_loss=2.69` (10x normal range). This reco
 - **Disk**: Stable at 100GB used / 868GB free (checkpoint: 91MB per save)
 - **Gemini API**: Intermittent 429 RESOURCE_EXHAUSTED (burst of 64 concurrent requests exceeds quota). Fallback chain resolves most failures.
 
+## 4b. Training Metrics — Attempt 25
+
+### 4b.1 Per-Step Summary (in progress)
+
+| Step | policy_loss | reward | correctness | reasoning_q | response_len | truncated | ppo_clip | ppo_kl | grad_norm | entropy | actor_lr |
+|------|------------|--------|-------------|-------------|-------------|-----------|----------|--------|-----------|---------|----------|
+| 1 | 0.982 | 0.552 | 43.8% | 0.723 | 2525 | 45.3% | 0.281 | +0.029 | 302.0 | 1.593 | 3.7e-8 |
+| 2 | 0.110 | 0.398 | 28.1% | 0.572 | 2681 | 68.8% | 0.282 | +0.045 | 191.5 | 1.571 | 1.1e-7 |
+| 3 | 0.087 | 0.609 | 50.0% | 0.773 | 2437 | 51.6% | 0.241 | +0.064 | 29.3 | 1.494 | 1.9e-7 |
+| 4 | 0.176 | 0.458 | 35.9% | 0.605 | 2648 | 62.5% | 0.240 | -0.059 | 166.5 | 1.453 | 2.6e-7 |
+
+### 4b.2 Early Observations (Steps 1-4)
+
+**Gradient norm**: 302 → 191 → **29** → 167. Highly variable. Step 3's 29.3 is much
+lower (closer to `max_norm=1.0`), possibly because that batch had lower loss. Steps
+1, 2, 4 all had >100x clipping, meaning effective updates are severely damped.
+
+**Entropy**: Declining slowly: 1.593 → 1.571 → 1.494 → 1.453. This is a slight
+downward trend but not alarming yet. If it drops below ~1.0, that's a concern. Will
+monitor for continued decline.
+
+**Correctness**: 43.8% → 28.1% → 50.0% → 35.9%. Average ~39.5%. Extreme variance due
+to only 1 prompt per step. Cannot distinguish signal from noise at this scale.
+
+**`advantage_std: 0.0` — not a bug.** Investigated and confirmed this is expected:
+with `micro_train_batch_size=1`, each training micro-batch contains 1 sample. Since
+`gamma=1.0` and the reward is placed at the last token, `get_cumulative_returns`
+assigns the same value to ALL tokens in a response. So within a single sample, all
+token-level advantages are identical → std = 0. The advantages ARE different between
+samples (driven by `group_reward_std: 0.15-0.19`), which is what drives learning.
+
+**Truncation**: 45% → 69% → 52% → 63%. Averaging ~57%. Similar to attempt 24.
+
+**KL**: 0.029 → 0.045 → 0.064 → -0.059. The sign flip at step 4 is notable — negative
+KL means the current policy assigns HIGHER probability to some actions than the
+reference policy did. With `init_kl_coef=0`, there's no penalty for this.
+
+**Key concern (RESOLVED)**: The teacher appeared to score 0% on AIME, suggesting
+capability inversion. This was a configuration bug — Gemini 3 Pro with
+`thinking_level=high` + 16k output tokens scores **100%** on AIME eval. See Section 5.1
+for details. The reward function must be updated to enable thinking mode.
+
+### 4b.3 Timing (Attempt 25)
+
+- **Per step**: ~13 min (generation ~1:44, reward ~1:00, forward ~1:35, training ~8:00, sync ~0:18)
+- **Per episode**: ~2 hours (9 global steps × 72 prompts / 8 per batch)
+- **Total (50 episodes)**: ~100 hours (~4.2 days)
+- **First held-out eval**: Step 10 (~episode 2, ~4 hours in)
+- **Training started**: 2026-02-21 01:23 UTC
+
+### 4b.4 LoRA Weight Sync Details
+
+The working LoRA sync pipeline (after 4 sub-attempts):
+1. Actor collects 288 LoRA A/B params via ZeRO-3 AllGather (0.2s, 95.6 MB)
+2. Actor calls `ray.put(lora_state)` → ObjectRef in Ray object store
+3. Engine resolves ObjectRef, converts tensors to `(shape, dtype_str, list)` tuples
+4. Engine dispatches via `collective_rpc("apply_lora_delta", args=(serializable, scaling))`
+5. Each TP worker reconstructs tensors from tuples
+6. Worker computes `delta = scaling * B @ A` for each LoRA pair (scaling=2.0)
+7. Worker applies delta using save-load-add pattern:
+   - `saved = param.data.clone()`
+   - `load_weights([(name, delta)])` — correctly shards delta for TP
+   - `param.data.add_(saved)` — adds sharded delta to original weight
+8. Total time: ~18s (dominated by tensor serialization and load_weights calls)
+
 ---
 
 ## 5. Baseline Scores
 
-| Model | Dataset | Metric | Score |
-|-------|---------|--------|-------|
-| Teacher (Gemini 3 Pro) | AIME eval (18) | Exact Match | 0% |
-| Teacher (Gemini 3 Pro) | MATH45 eval (18) | Exact Match | 27.8% |
-| Base Student (gpt-oss-120b) | AIME eval (18) | pass@1 | TBD |
-| RL Student (step 10) | AIME eval (18) | pass@1 | TBD (pending eval) |
+| Model | Dataset | Metric | Score | Date | Config |
+|-------|---------|--------|-------|------|--------|
+| Teacher (Gemini 3 Pro) | AIME eval (18) | Exact Match | **100.0%** (18/18) | 2026-02-21 | thinking_level=high, max_output_tokens=16384 |
+| Teacher (Gemini 3 Pro) | AIME eval (18) | Exact Match | **0.0%** (0/18) | 2026-02-21 | no thinking, max_output_tokens=4096 |
+| Teacher (Gemini 3 Pro) | MATH45 eval (30) | Exact Match | **20.0%** (6/30) | 2026-02-21 | no thinking, max_output_tokens=4096 |
+| Base Student (gpt-oss-120b) | AIME train (72) | pass@1 (estimate) | **~39.5%** (steps 1-4 avg) | 2026-02-21 | generate_max_len=3072 |
+| Base Student (gpt-oss-120b) | AIME eval (18) | pass@1 | TBD | — | |
+| **Base Student (gpt-oss-20b)** | **AIME eval (18)** | **pass@1** | **27.8%** (5/18) | 2026-02-21 | max_tokens=3072, temp=0.0 |
+| **Base Student (gpt-oss-20b)** | **MATH45 eval (18)** | **pass@1** | **44.4%** (8/18) | 2026-02-21 | max_tokens=3072, temp=0.0 |
 
-**Note**: Teacher scores 0% on AIME because AIME problems require deep multi-step reasoning that exceeds Gemini's capability at temperature=0. The teacher's value is in its reasoning quality assessment (reward signal), not in solving AIME directly.
+### 5.1 Teacher Evaluation — Root Cause of 0% AIME Score
+
+**Initial finding**: Gemini 3 Pro scored 0/18 on AIME with our default eval_baseline.py
+configuration (no thinking mode, 4096 max output tokens). This contradicted published
+benchmarks reporting ~95% AIME accuracy.
+
+**Root cause**: Two configuration errors were responsible:
+1. **Missing thinking mode**: Gemini 3 Pro requires `thinking_level=high` (via
+   `ThinkingConfig`) to activate extended reasoning. Without it, the model gives
+   surface-level answers without deep mathematical reasoning.
+2. **Insufficient output tokens**: With `max_output_tokens=4096`, the model's reasoning
+   + JSON output frequently exceeds the limit. The structured JSON response gets
+   truncated mid-string, causing parse failures. 7 out of 10 responses failed to parse
+   at 4096 tokens. Of the 7 truncated responses, 4 had the correct answer visible in
+   the truncated text — the model was solving the problems but we couldn't read the answer.
+
+**Fix**: Using `thinking_level=high` + `max_output_tokens=16384` → **18/18 correct (100%)**.
+
+**Detailed results** (`eval_gemini_aime.py`, structured output with JSON schema):
+| Problem | Gold | Pred | Correct |
+|---------|------|------|---------|
+| AIME2025-01 | 104 | 104 | Y |
+| AIME2025-02 | 371 | 371 | Y |
+| AIME2025-03 | 204 | 204 | Y |
+| AIME2025-04 | 25 | 25 | Y |
+| AIME2025-05 | 39 | 39 | Y |
+| AIME2025-06 | 396 | 396 | Y |
+| AIME2025-07 | 73 | 73 | Y |
+| AIME2025-08 | 23 | 23 | Y |
+| AIME2025-09 | 259 | 259 | Y |
+| AIME2025-10 | 16 | 16 | Y |
+| AIME2025-11 | 468 | 468 | Y |
+| AIME2025-12 | 82 | 82 | Y |
+| AIME2025-13 | 244 | 244 | Y |
+| AIME2025-14 | 80 | 80 | Y |
+| AIME2025-15 | 240 | 240 | Y |
+| AIME2025-16 | 113 | 113 | Y |
+| AIME2025-17 | 79 | 79 | Y |
+| AIME2025-18 | 896 | 896 | Y |
+
+**Lesson**: Gemini 3 Pro is a highly capable AIME solver when configured correctly.
+The teacher is NOT weaker than the student — the 0% score was a configuration bug.
+
+### 5.2 Implications for Reward Function
+
+**The teacher-student capability inversion is resolved.** With `thinking_level=high`,
+Gemini 3 Pro achieves 100% on AIME — far exceeding the student's ~40%. This means:
+1. The `reasoning_quality` signal from Gemini is now meaningful — it's coming from a
+   model that can actually solve these problems.
+2. The current reward function (`0.6 * correctness + 0.4 * reasoning_quality`) is
+   reasonable IF we configure Gemini with thinking mode in the reward function.
+3. However, enabling thinking mode in the reward function will significantly increase
+   API costs and latency (each reward call will take longer due to extended reasoning).
+
+**Action required**: Update `reward_func.py` to use `thinking_level=high` and
+`max_output_tokens=16384` when calling Gemini for reasoning quality assessment.
+Alternatively, since the teacher is so capable, consider restructuring the reward:
+- **Option A**: Keep current weights, enable thinking mode in reward calls
+- **Option B**: Increase correctness weight (0.8/0.2) since teacher can verify correctness
+  itself, reducing the need for separate reasoning quality scoring
+- **Option C**: Use Gemini with thinking to VERIFY correctness instead of/in addition to
+  regex-based exact match, then use pure EM for reward
+
+### 5.3 Student Baseline
+
+#### gpt-oss-120b (proxy baseline from training steps 1-4)
+
+Steps 1-4 training-set correctness gives a rough estimate of base model ability on AIME:
+- Step 1: 43.8%, Step 2: 28.1%, Step 3: 50.0%, Step 4: 35.9%
+- Average: **~39.5%** (but high variance — only 1 prompt per step)
+- These generations used the base model weights (LR still in warmup, effective
+  updates are negligible due to 100-300x gradient clipping)
+
+#### gpt-oss-20b (proper baseline via eval_baseline.py + vLLM)
+
+Evaluated with vLLM 0.15.1 on 1x H100, `max_tokens=3072`, `temperature=0.0`:
+
+**AIME eval (18 problems)**: **5/18 correct (27.8%)**
+- Correct: #6 (396), #10 (16), #11 (468), #13 (244), #17 (79)
+- 9 problems had empty extracted answers — model often fails to use `\boxed{}`
+  format or generates responses without reaching a final answer
+- The 20b model solves fewer AIME problems than 120b (~28% vs ~40%)
+
+**MATH45 eval (18 problems)**: **8/18 correct (44.4%)**
+- Stronger on MATH Level 4-5 than on AIME, as expected (MATH is easier)
+- Some failures due to answer format mismatch (e.g., `40\text{ cm}` vs `40`)
+
+#### gpt-oss-20b vs 120b: Student Model Choice
+
+| Factor | gpt-oss-120b | gpt-oss-20b |
+|--------|-------------|-------------|
+| Total params | 117B (5.1B active) | 21B (3.6B active) |
+| AIME baseline | ~39.5% (proxy) | 27.8% (measured) |
+| MATH45 baseline | TBD | 44.4% |
+| GPU for inference | 2x H100 (TP=2) | 1x H100 |
+| GPU for training | 4x H100 (ZeRO-3 + offload) | TBD (likely 1-2x H100) |
+| Training speed | ~13 min/step | TBD (significantly faster) |
+| Disk footprint | ~30 GB (MXFP4) | ~11 GB (MXFP4) |
+
+**Trade-off**: gpt-oss-20b enables faster experimentation (more attempts to tune
+reward function, hyperparameters, etc.) at the cost of a lower AIME baseline (28% vs
+40%). The 20b model's AIME performance is still in the "learnable" zone (20-70%).
+
+**Recommendation**: Use gpt-oss-20b for rapid iteration to perfect the training recipe
+(reward function, learning rate, KL coefficient, etc.), then apply the validated recipe
+to gpt-oss-120b for the final training run.
+
+### 5.4 Action Items
+- [ ] Run proper gpt-oss-120b baseline with eval_baseline.py (vLLM server crashed on
+  startup — needs debugging, likely CUDA_VISIBLE_DEVICES conflict)
+- [ ] For future training runs: add `--eval_steps 1` to force step-0 eval
+- [x] Update `reward_func.py` to use Gemini thinking mode (pending decision on approach)
+- [ ] Decide on student model: gpt-oss-20b (fast iteration) vs 120b (higher ceiling)
 
 ---
 
@@ -292,6 +492,8 @@ All patches are in `patches/` and applied via `bash apply_patches.sh`.
 | `metrics_actor.patch` | Grad norm, advantage stats, entropy distribution | Diagnose loss spikes and detect policy collapse |
 | `metrics_experience.patch` | Reward distribution stats, high-reward-but-wrong rate | Detect reward hacking and understand reward variance |
 | `metrics_trainer.patch` | Per-step JSONL + sample output logging to /mnt/scratch | Persistent metrics for post-hoc analysis and presentations |
+| `vllm_engine.patch` | `apply_lora_update` + `update_weight_from_ref` on LLMRayActor | Dispatches LoRA delta and per-weight sync to vLLM workers via collective_rpc |
+| `vllm_worker.patch` | `apply_lora_delta` + `update_weight_from_ray_ref` on WorkerWrap | Reconstructs serialized tensors, computes delta=B@A, applies via save-load-add |
 
 ---
 
@@ -304,6 +506,12 @@ All patches are in `patches/` and applied via `bash apply_patches.sh`.
 2. **Checkpoint size can silently kill training.** PeftModel + ZeRO-3 saves full model shards (~200 GB) alongside the tiny LoRA adapter (~90 MB). Always verify checkpoint size on first save.
 
 3. **NCCL is fragile across process boundaries.** Ray actors, vLLM subprocess workers, and DeepSpeed all have their own NCCL expectations. When they conflict, fall back to simpler communication (Ray object store, shared memory).
+
+6. **vLLM compiled DAGs block `ray.get()`.** vLLM v1 with Ray TP uses compiled DAGs internally. Worker methods called via `collective_rpc` run inside the DAG execution thread. Calling `ray.get()` there causes a deadlock because the thread cannot yield. Pass all data through `collective_rpc` args instead.
+
+7. **vLLM's msgspec serializer cannot handle torch tensors.** Convert to `(shape_list, dtype_string, data_list)` tuples before passing through `collective_rpc`. Workers reconstruct with `torch.tensor(data, dtype=dtype).reshape(shape)`.
+
+8. **TP-safe weight delta application**: Not all vLLM models support `load_weights(add_to_existing=True)`. The universally compatible pattern is: save original param, call `load_weights(delta)` to shard correctly for TP, then add saved original back.
 
 4. **Gradient checkpointing mode must match your training strategy.** ZeRO-3 + CPU offload changes tensor shapes dynamically; only reentrant checkpointing tolerates this.
 
@@ -368,8 +576,230 @@ All patches are in `patches/` and applied via `bash apply_patches.sh`.
 
 4. **Optimal group size?** Currently `n_samples_per_prompt=8`. Larger groups (16, 32) give better advantage estimates but cost more compute per step. With AIME's low solve rate, larger groups may be critical.
 
-5. **Should we use MATH Level 4-5 instead of (or in addition to) AIME?** AIME may be too hard for meaningful learning signal. The teacher (Gemini) scores 0% on AIME but 28% on MATH — suggesting MATH problems are in the "learnable" difficulty range.
+5. **Should we use MATH Level 4-5 instead of (or in addition to) AIME?** AIME may be too hard for meaningful learning signal. The teacher (Gemini) scores 0% on AIME but 20% on MATH — suggesting MATH problems are in the "learnable" difficulty range.
+
+6. **Teacher-student capability inversion (RESOLVED).** Previously appeared that the
+   teacher scored 0% on AIME while the student scored ~40%. Root cause: Gemini was not
+   configured with thinking mode (`thinking_level=high`) and had insufficient output tokens
+   (4096 vs needed 16384). With correct configuration, Gemini 3 Pro scores **100%** on
+   AIME eval (18/18). The teacher is far more capable than the student. The reward function
+   needs to be updated to enable thinking mode. See Section 5.1 for full analysis.
+
+7. **gpt-oss-20b as student model?** With only 21B total params (3.6B active), gpt-oss-20b
+   would train much faster, fit on fewer GPUs, and allow more experimental iterations.
+   However, its baseline AIME performance is unknown and likely lower than 120b's ~40%.
+   Need to evaluate before deciding. Key trade-off: faster iteration vs lower ceiling.
 
 ---
 
-*Last updated: 2026-02-20, Attempt 24 stopped at Step 17, Attempt 25 starting*
+### 8.5 Gemini API Lessons
+
+1. **Gemini 3 Pro requires `thinking_level=high` for hard math.** Without thinking mode,
+   the model gives surface-level answers and scores 0% on AIME. With thinking mode, it
+   scores 100%. This is not documented prominently in the API docs.
+
+2. **`max_output_tokens` must account for reasoning + response.** With thinking mode, the
+   model produces long reasoning traces. At 4096 tokens, 70% of responses were truncated
+   mid-JSON, causing parse failures. 16384 tokens was sufficient for all 18 AIME problems.
+
+3. **`thinking_level` vs `thinking_budget`**: The correct parameter for Gemini 3 is
+   `thinking_level` (values: "low", "high") set via `ThinkingConfig`. The older
+   `thinking_budget` parameter did not activate thinking in our tests. Always use
+   `thinking_level` with `ThinkingConfig`.
+
+4. **Structured output + thinking**: Combining JSON schema enforcement
+   (`response_mime_type="application/json"`, `response_json_schema=...`) with thinking
+   mode works correctly. The model reasons internally, then outputs valid JSON.
+
+---
+
+*Last updated: 2026-02-21. Attempt 25 stopped at step 4 to investigate baselines.
+Next: SFT (if needed) → RL with Gemini judge on gpt-oss-20b.*
+
+---
+
+## 11. Phase 2: SFT → RL Pipeline for gpt-oss-20b
+
+### 11.1 Decision: Student Model = gpt-oss-20b
+
+Selected gpt-oss-20b for rapid iteration. Key trade-offs:
+
+| Factor | gpt-oss-120b | gpt-oss-20b |
+|--------|-------------|-------------|
+| Total / active params | 117B / 5.1B | 21B / 3.6B |
+| AIME pass@1 (3k tokens) | ~39.5% (proxy) | 27.8% |
+| AIME pass@1 (20k, high) | TBD | **50.0% (9/18)** |
+| MATH45 pass@1 (3k) | TBD | 44.4% |
+| GPU for inference | 2×H100 (TP=2) | 1×H100 |
+| Disk footprint | ~30 GB | ~11 GB |
+
+### 11.2 Updated Baselines (gpt-oss-20b)
+
+| Dataset | Config | Score | Notes |
+|---------|--------|-------|-------|
+| AIME eval (18) | max_tokens=3072, temp=0 | 5/18 (27.8%) | 9 empty answers — format/truncation issue |
+| AIME eval (18) | reasoning=high, max_tokens=20000 | **9/18 (50.0%)** | All wrong answers hit 20k token limit |
+| MATH45 eval (18 subset) | max_tokens=3072, temp=0 | 8/18 (44.4%) | Some format mismatch |
+| Apex Shortlist (48) | reasoning=medium, max_tokens=20k | **TBD** | Running |
+
+Key finding: the 3072-token baseline (27.8%) was bottlenecked by truncation and reasoning
+budget. With `reasoning=high` and 20k tokens, the model reaches 50% on AIME. This means
+the model already has substantial capability — the question is whether SFT is needed at all,
+or if we can go straight to RL.
+
+### 11.3 NuminaMath-1.5 Dataset Analysis
+
+**Full dataset**: 896,215 examples.
+
+**Filter pipeline** (for integer-only, verifiable problems):
+
+| Stage | Remaining | Removed |
+|-------|-----------|---------|
+| Start | 896,215 | — |
+| question_type == "math-word-problem" | 631,522 | 264,693 (29.5%) |
+| Clean integer answer | ~286k | ~345k |
+| Exclude AMC/AIME sources | ~285k | ~920 |
+| Require valid problem + solution | ~265k | ~18k |
+| Deduplicate by problem hash | ~264k | ~1,264 |
+| Remove too-short / empty-solution | ~265,128 | ~962 |
+
+**Token length distribution** (50k sample, gpt-oss-20b tokenizer):
+
+| Metric | Prompt | Solution | Combined |
+|--------|--------|----------|----------|
+| p50 | 58 | 278 | 344 |
+| p90 | 129 | 599 | 711 |
+| p95 | 167 | 772 | 905 |
+| p99 | 278 | 1,234 | 1,371 |
+| p99.5 | 354 | 1,471 | 1,608 |
+| max | 1,580 | 4,379 | 4,624 |
+
+**Critical finding**: NuminaMath solutions are very short. `max_seq_len=4096` has
+effectively 0% truncation. The plan's discussion of 8k/16k/32k is unnecessary for this
+dataset. This also means SFT will be very fast (short sequences = large effective batch size).
+
+**Source distribution** (after all filters, 265k examples):
+
+| Source | Count | % |
+|--------|-------|---|
+| orca_math | ~93k | 35% |
+| synthetic_math | ~74k | 28% |
+| cn_k12 | ~40k | 15% |
+| olympiads | ~36k | 14% |
+| metamath | ~8k | 3% |
+| aops_forum | ~6k | 2% |
+
+**Integer answer range**: 84% in [0, 999]. Some extreme outliers exist.
+
+### 11.4 Data Prepared
+
+| File | Size | Purpose |
+|------|------|---------|
+| data/sft_train.jsonl | 5,000 | Micro-SFT (only if format compliance check fails) |
+| data/sft_dev.jsonl | 500 | Dev set for SFT eval |
+| data/sft_rl_pool.jsonl | 50,000 | RL training pool (no overlap with SFT) |
+| data/apex_shortlist.jsonl | 48 | Apex Shortlist eval (primary) |
+
+All splits are deduped by problem hash. No overlap between SFT train, dev, and RL pool.
+
+### 11.5 MathArena Apex Shortlist 2025 Inspection
+
+48 problems from international math competitions (USA TST, HMMT, IMO Shortlist, etc.).
+
+**Answer type breakdown**:
+- ~30 problems: clean integer answers (evaluable with exact match)
+- ~5 problems: fractions (\frac{a}{b})
+- ~13 problems: symbolic/parametric (n-1, 4N^3+..., etc.) — not evaluable with EM
+
+For our eval, we use the ~35 problems with integer or fraction answers.
+
+### 11.6 Format Compliance Check — SFT Decision
+
+**Method**: 20 MATH Level 4-5 problems, reasoning=medium, max_tokens=8192, temp=0.
+
+**Results**:
+
+| Metric | Value |
+|--------|-------|
+| \boxed{} in content | 18/20 (90%) |
+| \boxed{} in reasoning | 12/20 (60%) |
+| \boxed{} anywhere | **19/20 (95%)** |
+| Parsed via \boxed{} | 19/20 (95%) |
+| Parsed via last_number fallback | 1/20 (5%) |
+| Parse failed | 0/20 (0%) |
+| Truncated (hit 8k limit) | 2/20 (10%) |
+
+**The single non-\boxed{} result (problem 13) was caused by truncation at 8k tokens**, not
+format non-compliance. When the model has enough token budget, it consistently produces
+`\boxed{}`.
+
+**Decision: SKIP SFT. Go directly to RL with pure exact-match reward.**
+
+The model's native format compliance is 95%+ when not truncated. SFT would be wasted
+compute for this model. The key insight: gpt-oss-20b is already instruction-tuned and
+reliably produces `\boxed{}` — the earlier 27.8% baseline (at 3072 tokens) was bottlenecked
+by truncation, not format compliance.
+
+### 11.7 Reward Function: Pure Exact-Match
+
+**Decision**: Use pure exact-match reward (no Gemini judge) for the first RL run.
+
+**`reward_func_em.py`**:
+- Extract answer from `\boxed{...}` (fallback: last number)
+- Normalize and compare to ground truth
+- reward = 1 if correct, 0 otherwise
+- Zero API cost, zero latency, deterministic
+
+**Rationale**: The Gemini quality signal in the original reward function (0.4 weight for
+reasoning quality) was giving partial credit to wrong answers, which incentivizes judge-
+pleasing rather than correctness. Pure EM eliminates this failure mode. If reward sparsity
+becomes a problem (baseline solve rate < 5%), we can add curriculum or Gemini quality
+scoring for correct-only answers later.
+
+### 11.8 RL Training Configuration (gpt-oss-20b)
+
+**File**: `train_grpo_20b.sh`
+
+| Parameter | Value | Rationale |
+|-----------|-------|-----------|
+| Model | openai/gpt-oss-20b | Faster iteration than 120b |
+| Data | NuminaMath RL pool (50k) | Integer-only, deduped, no AIME overlap |
+| Reward | Pure exact-match | No Gemini dependency |
+| Actor GPUs | 4 | 84GB bf16 / 4 = 21GB/GPU, fits without offload |
+| vLLM GPUs | 4 (2 engines × TP=2) | Fast rollout generation |
+| ZeRO stage | 3 | Parameter partitioning across 4 GPUs |
+| CPU offload | **No** (84GB / 4 = 21GB fits comfortably) | Add if OOM |
+| LoRA rank | 32 | Smaller model → smaller rank (attention-only) |
+| LoRA alpha | 64 | Scaling = alpha/rank = 2.0 |
+| LR | 5e-7 | Conservative for smaller model |
+| KL coef | 0.001 | Non-zero for stability (learned from 120b instability) |
+| n_samples_per_prompt | 8 | Group size for advantage estimation |
+| rollout_batch_size | 16 | Larger than 120b (faster model) |
+| generate_max_len | 4096 | Start conservative, increase if truncation high |
+| prompt_max_len | 1024 | NuminaMath prompts are short (p99.5 = 354 tokens) |
+| num_episodes | 20 | Start with 20, extend if learning |
+| Eval | AIME eval (18 problems) every 10 steps | Held-out exact-match accuracy |
+| Checkpoints | /mnt/data (1TB NVMe) | Avoid boot disk space issues |
+| Logs | /mnt/scratch (5.9TB RAID) | Persistent metrics |
+
+**Changes from 120b training**:
+1. No CPU parameter offload (model fits in GPU memory)
+2. No Gemini API calls (pure EM reward)
+3. Larger training pool (50k vs 72 problems)
+4. Smaller LoRA rank (32 vs 64)
+5. Lower LR (5e-7 vs 1e-6)
+6. Non-zero KL coefficient (0.001 vs 0)
+
+### 11.9 Apex Shortlist Baseline
+
+**Status**: Running (medium reasoning, 20k tokens). 39 evaluable problems, 9 skipped
+(symbolic/parametric). Results will be added when complete.
+
+### 11.10 Next Steps
+
+1. Apply patches to OpenRLHF (`bash apply_patches.sh`)
+2. Create branch `attempt-26-grpo-20b-em`
+3. Run first training attempt
+4. Monitor metrics: correctness, reward, grad norm, truncation rate, entropy
+5. If pure EM works → evaluate checkpoints on AIME + Apex Shortlist
+6. If reward too sparse → add curriculum (easy problems first) or Gemini quality signal

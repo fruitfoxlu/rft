@@ -1,6 +1,6 @@
 --- a/openrlhf/trainer/ray/vllm_worker_wrap.py
 +++ b/openrlhf/trainer/ray/vllm_worker_wrap.py
-@@ -72,3 +72,75 @@
+@@ -72,3 +72,98 @@
          self.model_runner.model.load_weights(weights=[(name, weight)])
          torch.cuda.synchronize()
 +
@@ -18,6 +18,13 @@
 +        if empty_cache:
 +            torch.cuda.empty_cache()
 +
++    def apply_lora_delta_from_ref(self, lora_ref_bytes, scaling):
++        """Resolve lora_state from Ray object store and apply deltas."""
++        import ray
++        lora_ref = ray.ObjectRef.from_binary(lora_ref_bytes)
++        lora_state = ray.get(lora_ref)
++        return self.apply_lora_delta(lora_state, scaling)
++
 +    def apply_lora_delta(self, lora_state, scaling):
 +        """Apply LoRA weight deltas directly to model parameters.
 +
@@ -25,12 +32,27 @@
 +            delta = scaling * B @ A
 +        and adds it in-place to the corresponding base weight.
 +
-+        Each TP worker operates on its own shard, so in-place
-+        addition of the full delta is correct — the worker's
-+        param.data is already the local shard.
++        Uses load_weights for TP-correct sharding of the delta,
++        then adds the sharded delta to the saved original weight.
 +        """
 +        import re
 +        import torch
++
++        # collective_rpc serializes tensors as (shape, dtype_str, list) tuples;
++        # reconstruct them back to tensors
++        dtype_map = {
++            "torch.bfloat16": torch.bfloat16,
++            "torch.float16": torch.float16,
++            "torch.float32": torch.float32,
++        }
++        for name in lora_state:
++            v = lora_state[name]
++            if isinstance(v, (list, tuple)) and len(v) == 3 and isinstance(v[0], list) and isinstance(v[1], str):
++                shape, dtype_str, data = v
++                dtype = dtype_map.get(dtype_str, torch.bfloat16)
++                lora_state[name] = torch.tensor(data, dtype=dtype).reshape(shape)
++            elif not isinstance(v, torch.Tensor):
++                lora_state[name] = torch.tensor(v)
 +
 +        # Group LoRA params by base module
 +        lora_a = {}
@@ -52,29 +74,22 @@
 +            # Clean PEFT naming to match vLLM param names
 +            clean = re.sub(r"^base_model\.model\.", "", base_name)
 +            clean = re.sub(r"\.base_layer$", "", clean)
-+            # Compute full delta
++            # Compute full delta (unsharded)
 +            delta = (scaling * (B.float() @ A.float())).to(dtype=torch.bfloat16)
-+            # Use load_weights which handles TP sharding
-+            self.model_runner.model.load_weights(weights=[(clean, delta.to("cuda"))], add_to_existing=True)
-+            applied += 1
 +
-+        if applied == 0:
-+            # Fallback: load_weights may not support add_to_existing
-+            # Try in-place addition on matching params
-+            for base_name in lora_a:
-+                if base_name not in lora_b:
-+                    continue
-+                A = lora_a[base_name]
-+                B = lora_b[base_name]
-+                clean = re.sub(r"^base_model\.model\.", "", base_name)
-+                clean = re.sub(r"\.base_layer$", "", clean)
-+                delta = (scaling * (B.float() @ A.float())).to(dtype=torch.bfloat16).to("cuda")
-+                for pname, param in self.model_runner.model.named_parameters():
-+                    if pname == clean:
-+                        param.data.add_(delta)
-+                        applied += 1
-+                        break
-+                del delta
++            # Use load_weights to correctly shard the delta (handles TP),
++            # then add the sharded delta back to the saved original weight.
++            for pname, param in self.model_runner.model.named_parameters():
++                if pname == clean:
++                    saved = param.data.clone()
++                    # load_weights replaces param with correctly-sharded delta
++                    self.model_runner.model.load_weights(weights=[(clean, delta.to("cuda"))])
++                    # Now param.data contains the sharded delta; add saved original
++                    param.data.add_(saved)
++                    del saved
++                    applied += 1
++                    break
++            del delta
 +
 +        torch.cuda.empty_cache()
 +        return applied

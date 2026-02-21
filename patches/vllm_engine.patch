@@ -1,6 +1,6 @@
 --- a/openrlhf/trainer/ray/vllm_engine.py
 +++ b/openrlhf/trainer/ray/vllm_engine.py
-@@ -116,6 +116,22 @@
+@@ -116,6 +116,31 @@
              args=(name, dtype, shape, empty_cache),
          )
 
@@ -17,12 +17,20 @@
 +    async def apply_lora_update(self, lora_state, scaling):
 +        """Apply LoRA adapter weight deltas to the base model.
 +
-+        Dispatches to workers via collective_rpc. Each TP worker
-+        computes delta = scaling * B @ A and applies it to its shard.
++        Converts tensors to (shape, dtype, list) tuples for msgspec
++        serialization through collective_rpc. Workers reconstruct tensors.
 +        """
++        import torch
++
++        serializable = {}
++        for name, tensor in lora_state.items():
++            if isinstance(tensor, torch.Tensor):
++                serializable[name] = (list(tensor.shape), str(tensor.dtype), tensor.tolist())
++            else:
++                serializable[name] = tensor
 +        return await self.llm.collective_rpc(
 +            "apply_lora_delta",
-+            args=(lora_state, scaling),
++            args=(serializable, scaling),
 +        )
 +
      async def update_weight_cuda_ipc(self, name, dtype, shape, ipc_handles, empty_cache=False):

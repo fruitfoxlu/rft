@@ -492,6 +492,7 @@ All patches are in `patches/` and applied via `bash apply_patches.sh`.
 | `metrics_actor.patch` | Grad norm, advantage stats, entropy distribution | Diagnose loss spikes and detect policy collapse |
 | `metrics_experience.patch` | Reward distribution stats, high-reward-but-wrong rate | Detect reward hacking and understand reward variance |
 | `metrics_trainer.patch` | Per-step JSONL + sample output logging to /mnt/scratch | Persistent metrics for post-hoc analysis and presentations |
+| `ratio_logging_loss.patch` | Log-ratio clamping + ratio tail stats in PolicyLoss.forward | Diagnose gradient spikes: log both raw and clamped log_ratio_max, ratio_max, p99 |
 | `vllm_engine.patch` | `apply_lora_update` + `update_weight_from_ref` on LLMRayActor | Dispatches LoRA delta and per-weight sync to vLLM workers via collective_rpc |
 | `vllm_worker.patch` | `apply_lora_delta` + `update_weight_from_ray_ref` on WorkerWrap | Reconstructs serialized tensors, computes delta=B@A, applies via save-load-add |
 
@@ -613,8 +614,8 @@ All patches are in `patches/` and applied via `bash apply_patches.sh`.
 
 ---
 
-*Last updated: 2026-02-21. Attempt 25 stopped at step 4 to investigate baselines.
-Next: SFT (if needed) → RL with Gemini judge on gpt-oss-20b.*
+*Last updated: 2026-02-21. Attempt 26 concluded (step 60+, degrading). Step 30 locked as best checkpoint (8/18 AIME).
+Attempt-27 ready: eps_clip 0.1, ratio tail logging, OOD probe eval, spike sample logging.*
 
 ---
 
@@ -792,14 +793,315 @@ scoring for correct-only answers later.
 
 ### 11.9 Apex Shortlist Baseline
 
-**Status**: Running (medium reasoning, 20k tokens). 39 evaluable problems, 9 skipped
-(symbolic/parametric). Results will be added when complete.
+**Status**: Partial results (killed when training started, 27/39 problems attempted).
 
-### 11.10 Next Steps
+| Metric | Value |
+|--------|-------|
+| Total problems | 48 |
+| Evaluable (integer/fraction) | 39 |
+| Skipped (symbolic/parametric) | 9 |
+| Attempted before kill | 27 |
+| Correct | **2/27 (7.4%)** |
+| Config | reasoning=medium, max_tokens=20000 |
 
-1. Apply patches to OpenRLHF (`bash apply_patches.sh`)
-2. Create branch `attempt-26-grpo-20b-em`
-3. Run first training attempt
-4. Monitor metrics: correctness, reward, grad norm, truncation rate, entropy
-5. If pure EM works → evaluate checkpoints on AIME + Apex Shortlist
-6. If reward too sparse → add curriculum (easy problems first) or Gemini quality signal
+Correctly solved: `imosl-2024-n7` (59), `Taiwan TST 2025 #3 Quiz 1C` (74).
+
+Apex Shortlist is significantly harder than AIME (~7% vs 28% baseline). Full re-eval needed after training on a saved checkpoint.
+
+### 11.10 Attempt-26 Training Progress
+
+**Status**: Running (PID 198948, started 2026-02-21 15:08)
+
+#### Bugs Fixed During Launch
+
+1. **GPU allocation hang**: `init_kl_coef=0.001` creates a reference model. Default `ref_num_gpus_per_node=8` conflicted with 4 vLLM + 4 actor GPUs. Fix: `--colocate_actor_ref --ref_num_nodes 1 --ref_num_gpus_per_node 4`.
+
+2. **DeepSpeed ZeRO-3 dtype mismatch**: 192 MoE gate/router parameters remained float32 after MXFP4 dequantization, causing `TypeError: output tensor must have the same type as input tensor` during optimizer step. Fix: explicit dtype casting to bf16 before `deepspeed.zero.Init()` in `actor.py`. Patch updated.
+
+#### Training Metrics (Steps 1-34)
+
+| Step | Reward | Correct | Boxed | Loss | GradNorm | Entropy | KL | ClipR | Trunc | RespLen |
+|------|--------|---------|-------|------|----------|---------|------|-------|-------|---------|
+| 1 | 0.391 | 0.391 | 0.523 | 0.025 | 12.75 | 1.324 | 0.000 | 0.067 | 0.070 | 1207 |
+| 2 | 0.445 | 0.445 | 0.695 | 0.021 | 5.07 | 1.266 | 0.000 | 0.084 | 0.211 | 1792 |
+| 3 | 0.586 | 0.586 | 0.625 | 0.014 | 9.43 | 1.246 | 0.000 | 0.060 | 0.188 | 1515 |
+| 4 | 0.531 | 0.531 | 0.609 | 0.017 | 1.45 | 1.228 | 0.000 | 0.111 | 0.141 | 1642 |
+| 5 | 0.438 | 0.438 | 0.438 | 0.025 | 5.01 | 1.375 | 0.000 | 0.137 | 0.414 | 2383 |
+| 6 | 0.648 | 0.648 | 0.484 | 0.024 | 14.57 | 1.198 | -0.001 | 0.144 | 0.125 | 1199 |
+| 7 | 0.523 | 0.523 | 0.688 | 0.021 | 13.55 | 1.270 | 0.000 | 0.175 | 0.102 | 1241 |
+| 8 | 0.594 | 0.594 | 0.695 | 0.024 | 4.38 | 1.338 | 0.000 | 0.189 | 0.125 | 1506 |
+| 9 | 0.461 | 0.461 | 0.633 | 0.007 | 0.72 | 1.311 | 0.000 | 0.182 | 0.203 | 1660 |
+| 10 | 0.516 | 0.516 | 0.664 | 0.019 | 1.69 | 1.241 | -0.001 | 0.197 | 0.039 | 1192 |
+| 11 | 0.438 | 0.438 | 0.359 | 0.013 | 1.85 | 1.439 | 0.001 | 0.178 | 0.336 | 2247 |
+| 12 | 0.633 | 0.633 | 0.523 | 0.054 | 11.35 | 1.252 | -0.003 | 0.209 | 0.062 | 845 |
+| 13 | 0.719 | 0.719 | 0.586 | 0.039 | 22.34 | 1.331 | -0.003 | 0.197 | 0.125 | 1429 |
+| 14 | 0.430 | 0.430 | 0.539 | 0.007 | 1.01 | 1.472 | 0.000 | 0.184 | 0.266 | 2138 |
+| 15 | 0.586 | 0.586 | 0.453 | 0.014 | 4.43 | 1.380 | -0.002 | 0.207 | 0.148 | 1443 |
+| 16 | 0.406 | 0.406 | 0.734 | 0.015 | 1.36 | 1.302 | 0.000 | 0.181 | 0.180 | 1656 |
+| 17 | 0.531 | 0.531 | 0.539 | 0.037 | 18.54 | 1.250 | -0.001 | 0.201 | 0.078 | 992 |
+| 18 | 0.664 | 0.664 | 0.656 | 0.020 | 3.12 | 1.260 | 0.000 | 0.193 | 0.133 | 1456 |
+| 19 | 0.477 | 0.477 | 0.461 | 0.014 | 3.33 | 1.306 | 0.002 | 0.189 | 0.219 | 1629 |
+| 20 | 0.438 | 0.438 | 0.484 | 0.045 | 21.79 | 1.333 | -0.001 | 0.187 | 0.266 | 1929 |
+| 21 | 0.234 | 0.234 | 0.531 | 0.022 | 8.02 | 1.338 | -0.001 | 0.201 | 0.188 | 1522 |
+| 22 | 0.617 | 0.617 | 0.539 | 0.054 | **70.29** | 1.320 | -0.009 | 0.227 | 0.016 | 815 |
+| 23 | 0.531 | 0.531 | 0.562 | 0.028 | 9.06 | 1.413 | -0.001 | 0.201 | 0.219 | 1952 |
+| 24 | 0.430 | 0.430 | 0.594 | 0.025 | 5.30 | 1.253 | 0.001 | 0.216 | 0.094 | 1121 |
+| 25 | 0.633 | 0.633 | 0.625 | 0.049 | 35.13 | 1.281 | -0.002 | 0.212 | 0.117 | 1215 |
+| 26 | 0.562 | 0.562 | 0.477 | 0.026 | 5.53 | 1.322 | 0.000 | 0.216 | 0.070 | 1069 |
+| 27 | 0.398 | 0.398 | 0.688 | 0.032 | 50.14 | 1.322 | -0.001 | 0.191 | 0.031 | 1548 |
+| 28 | 0.555 | 0.555 | 0.500 | 0.018 | 2.92 | 1.355 | -0.003 | 0.217 | 0.172 | 1361 |
+| 29 | 0.531 | 0.531 | 0.773 | 0.014 | 2.78 | 1.272 | 0.000 | 0.179 | 0.188 | 1848 |
+| 30 | 0.406 | 0.406 | 0.625 | 0.026 | 3.86 | 1.256 | 0.000 | 0.193 | 0.117 | 1392 |
+| 31 | 0.438 | 0.438 | 0.539 | 0.042 | 6.66 | 1.291 | -0.002 | 0.191 | 0.188 | 1601 |
+| 32 | 0.398 | 0.398 | 0.656 | 0.156 | **280.92** | 1.366 | 0.001 | 0.184 | 0.156 | 1773 |
+| 33 | 0.516 | 0.516 | 0.664 | 0.010 | 1.45 | 1.319 | -0.001 | 0.196 | 0.195 | 1588 |
+| 34 | 0.523 | 0.523 | 0.484 | 0.069 | **69.57** | 1.339 | 0.000 | 0.200 | 0.234 | 1740 |
+| 35 | 0.523 | 0.523 | 0.375 | 0.022 | 12.75 | 1.327 | 0.015 | 0.202 | 0.000 | 1621 |
+| 36 | 0.547 | 0.547 | 0.703 | 0.014 | 1.26 | 1.313 | 0.002 | 0.195 | 0.000 | 1512 |
+| 37 | 0.523 | 0.523 | 0.594 | 0.014 | 3.91 | 1.387 | 0.004 | 0.178 | 0.000 | 2180 |
+| 38 | 0.633 | 0.633 | 0.609 | 0.024 | 19.92 | 1.269 | 0.006 | 0.189 | 0.000 | 1435 |
+| 39 | 0.602 | 0.602 | 0.688 | 0.025 | 7.02 | 1.309 | 0.011 | 0.197 | 0.000 | 1393 |
+| 40 | 0.516 | 0.516 | 0.516 | 0.019 | 3.24 | 1.318 | -0.002 | 0.190 | 0.000 | 1376 |
+| 41 | 0.625 | 0.625 | 0.531 | 0.022 | 5.63 | 1.310 | -0.012 | 0.199 | 0.000 | 1498 |
+| 42 | 0.664 | 0.664 | 0.711 | 0.011 | 3.10 | 1.238 | -0.013 | 0.196 | 0.000 | 1344 |
+| 43 | 0.461 | 0.461 | 0.539 | 0.016 | 3.13 | 1.314 | 0.006 | 0.187 | 0.000 | 1757 |
+| 44 | 0.469 | 0.469 | 0.789 | 0.016 | 3.64 | 1.278 | 0.001 | 0.193 | 0.000 | 1325 |
+| 45 | 0.453 | 0.453 | 0.594 | 0.023 | 5.24 | 1.304 | -0.000 | 0.187 | 0.000 | 1564 |
+| 46 | 0.547 | 0.547 | 0.352 | 0.019 | 4.07 | 1.336 | 0.012 | 0.209 | 0.000 | 1029 |
+| 47 | 0.695 | 0.695 | 0.570 | 0.203 | **429.64** | 1.337 | 0.002 | 0.207 | 0.000 | 1049 |
+| 48 | 0.602 | 0.602 | 0.508 | 0.014 | 1.91 | 1.335 | 0.011 | 0.206 | 0.000 | 1087 |
+| 49 | 0.562 | 0.562 | 0.586 | 0.018 | 3.77 | 1.291 | 0.005 | 0.185 | 0.000 | 1442 |
+| 50 | 0.477 | 0.477 | 0.555 | 0.016 | 1.89 | 1.293 | -0.002 | 0.190 | 0.000 | 1381 |
+| 51 | 0.562 | 0.562 | 0.570 | 0.052 | 29.19 | 1.319 | 0.002 | 0.186 | 0.000 | 1740 |
+| 52 | 0.477 | 0.477 | 0.586 | 0.022 | **86.06** | 1.190 | -0.000 | 0.173 | 0.000 | 1699 |
+
+#### AIME 2024 Evaluation Trajectory
+
+| Step | pass@8 (problems) | pass@1 | Notes |
+|------|-------------------|--------|-------|
+| Baseline | 27.8% (5/18) | — | Pre-training |
+| 10 | **38.9% (7/18)** | 32.6% | +2 problems |
+| 20 | **38.9% (7/18)** | 35.4% | Peak pass@1 |
+| 30 | **44.4% (8/18)** | 34.7% | **Best checkpoint** (+3 problems) |
+| 40 | **38.9% (7/18)** | 27.8% | Regression; pass@1 back to baseline |
+| 50 | **38.9% (7/18)** | 27.1% | Continued decline; pass@1 below baseline |
+| 60 | **33.3% (6/18)** | 28.5% | pass@8 now only +1 problem over baseline |
+
+Config: temp=0.0, n=8 (`nondet_proxy_pass@8`, not true pass@k — see Section 11.10.1).
+
+**Analysis**: Step 30 was the peak (+3 AIME problems over baseline). Steps 40 and 50 both regressed to 7/18 (pass@8). More concerning is the pass@1 trajectory: it peaked at step 20 (35.4%), then declined steadily through step 50 (27.1%) — now *below* the pre-training baseline (27.8%). This suggests the model is becoming less reliable per-sample even as it occasionally reaches correct answers for 7 problems. The gradient norm spikes (especially the 429x spike at step 47) may have contributed by introducing noise into LoRA parameters despite clipping.
+
+**Rolling averages (training correctness)**:
+| Steps | Correct (avg) | Boxed (avg) | Loss (avg) | Max GradNorm | Entropy (avg) |
+|-------|---------------|-------------|------------|--------------|---------------|
+| 1-10 | 0.513 | 0.605 | 0.020 | 14.6 | 1.280 |
+| 11-20 | 0.532 | 0.534 | 0.026 | 22.3 | 1.332 |
+| 21-30 | 0.490 | 0.591 | 0.029 | 70.3 | 1.313 |
+| 31-40 | 0.522 | 0.583 | 0.040 | 280.9 | 1.324 |
+| 41-50 | 0.555 | 0.573 | 0.036 | 429.6 | 1.303 |
+
+Training correctness shows a slight upward trend (0.51 → 0.56) but AIME eval does not confirm this — the generalization gap is widening. Maximum gradient norm spikes are escalating each decade (14.6 → 22.3 → 70.3 → 280.9 → 429.6), though the model recovers immediately each time. The escalating spikes combined with declining eval performance suggest the current configuration has reached its useful training horizon.
+
+**Conclusion**: Attempt-26 has passed its useful training horizon. Step 60 eval (6/18 pass@8) confirms continued degradation. **Step 30 is locked as the best checkpoint** for reporting and as the fallback baseline. Post-hoc probe_set_200 evaluation on step 30 is still planned to confirm.
+
+**Best checkpoint**: `global_step30_hf` (8/18 AIME = 44.4%, +3 over baseline).
+
+#### Observations (Steps 1-34)
+
+**Positive signals (steps 1-30):**
+1. **Training correctness improved**: Step 1 reward=0.391 → rolling average ~0.50 by steps 20-34. Model is solving more training problems.
+2. **AIME eval improved**: 7/18 (38.9%) at step 10, 8/18 (44.4%) at step 30, up from 5/18 (27.8%) baseline. Real generalization through step 30.
+3. **Entropy stable**: Range 1.19-1.47 across all 52+ steps, no diversity collapse.
+4. **KL near zero**: Policy is updating but not drifting catastrophically from reference.
+5. **Truncation manageable**: Mostly <25%, `generate_max_len=4096` is adequate.
+6. **Peak correctness 0.719** (step 13): Model can solve ~72% of easy NuminaMath problems in a good batch.
+
+**Concerns:**
+1. **Gradient norm spikes escalating**: Full spike history (grad_norm > 10):
+   - Steps 1-10: max 14.6 (4 spikes)
+   - Steps 11-20: max 22.3 (5 spikes)
+   - Steps 21-30: max 70.3 (3 spikes)
+   - Steps 31-40: max 280.9 (4 spikes)
+   - Steps 41-50: max **429.6** (1 spike, step 47)
+   - Steps 51-52: max 86.1 (2 spikes in 2 steps)
+   These are *pre-clipping* values (`max_norm=1.0` is active). Model recovers within 1 step after each spike. But the escalating trend correlates with declining eval performance (see Section 11.12 for theory).
+2. **Train/eval divergence**: Training correctness improved (rolling avg 0.51 → 0.56) while AIME pass@1 degraded (35.4% peak → 27.1%). The model is overfitting to the NuminaMath training distribution.
+3. **No monotonic correctness trend**: Oscillates 0.23-0.72 with high variance. Normal for RL but makes individual step values unreliable — use rolling averages or probe sets.
+4. **`has_boxed` inconsistent**: Ranges 0.35-0.79 with no clear improvement. Format compliance is not being reliably learned.
+
+**Root cause analysis for gradient spikes:**
+- `max_norm=1.0` is already active -- spikes are *contained* by gradient clipping.
+- The logged `grad_norm` is the pre-clipping norm. A spike of 280 means the raw gradient was 280x the clip threshold, but the actual update used norm=1.0.
+- **Spikes do NOT correlate with advantage outliers.** Advantage stats (max, min, std) are identical at spike and non-spike steps (adv_max ≈ 0.011 in both cases).
+- **Spikes correlate with policy_loss magnitude.** Step 32: loss=0.156 (vs normal 0.01-0.02), grad_norm=280.9. This means individual tokens have extreme log-probability ratios (large shift from reference policy), not extreme advantages.
+- Likely cause: with `micro_train_batch_size=1` and gradient accumulation across 16 micro-batches, a single prompt with extreme token-level ratios can dominate the accumulated gradient. Clipping happens post-accumulation, so the spike is visible in pre-clip grad_norm.
+- Model recovers immediately (step after each spike has normal grad_norm), confirming clipping is working.
+- **Implication**: Advantage clipping would NOT fix these spikes. The correct interventions target the ratio (lower eps_clip, tighter PPO clipping) or the accumulation (per-micro-batch gradient clipping).
+- No NaN/Inf observed in any metric.
+
+#### Actions Taken
+
+1. **Grad clipping already enabled** (`--max_norm 1.0`): Confirmed in training config. The spikes are logged as pre-clipping values; actual updates are bounded. No additional action needed for current run.
+
+2. **Reward function instrumented** (`reward_func_em.py`): Added three new logging fields for next run:
+   - `parse_method`: 2.0=boxed, 1.0=last_number fallback, 0.0=none (numeric for tensor compatibility)
+   - `boxed_in_final`: 1.0 if last `\boxed{}` is in final 20% of response, 0.0 otherwise
+   - `truncated_response`: 1.0 if response appears truncated (heuristic: long + no boxed, or ends mid-sentence)
+
+   These will diagnose whether `has_boxed` failures are from: missing boxed entirely, boxed only in reasoning, or truncation preventing final output.
+
+3. **Probe sets created** (two complementary sets for different signals):
+   - **ID probe** (`data/probe_set_200.jsonl`): 200 problems from the RL training pool (seed=42). Measures in-distribution learning / stability. Use for early stopping.
+   - **OOD probe** (`data/probe_set_200_ood.jsonl`): 202 problems from held-out sources (170 MATH Level 4-5 + 32 Apex Shortlist). Verified disjoint from training pool by hash. Measures generalization. Use for checkpoint selection alongside AIME.
+
+   **Rationale**: ID probe tells you if the model is learning at all; OOD probe tells you if that learning generalizes. Attempt-26 showed train correctness improving (0.51 → 0.56) while AIME eval degraded (35.4% → 27.1% pass@1) — an ID-only probe would have missed this divergence.
+
+4. **Rolling average tracking**: Step-to-step correctness oscillation (0.2-0.7) is normal in RL. For trend analysis, use rolling averages over 10 steps rather than individual step values. Full run rolling averages:
+   - Steps 1-10: 0.513, Steps 11-20: 0.532, Steps 21-30: 0.490, Steps 31-40: 0.522, Steps 41-50: 0.555
+   - Training correctness shows slight upward trend but AIME eval does not confirm — classic train/eval divergence.
+
+#### Actions Planned for Next Run (Attempt-27)
+
+1. **Ratio tail logging (implemented, ready to apply)**:
+   - `ratio_logging_loss.patch`: Log-ratio clamping (`[-20, 20]` before `exp()`) + ratio tail stats per micro-batch (`log_ratio_max`, `log_ratio_min`, `log_ratio_raw_max`, `log_ratio_raw_min`, `ratio_max`, `log_ratio_abs_p99`, `tokens_in_batch`)
+   - Both raw (pre-clamp) and clamped log_ratio_max are logged, so we can see how extreme tails really are
+   - `ppo_actor.patch`: Reads ratio stats from PolicyLoss and logs to training metrics JSONL
+
+2. **Spike sample logging (implemented, ready to apply)**:
+   - When `grad_norm > 50`, dumps prompt hashes (SHA-256) to `spike_log.jsonl` along with grad_norm, policy_loss, and ratio stats
+   - Enables post-hoc replay: find which prompts cause spikes, inspect token-level ratios
+
+3. **Eval config fix + metrics labeling**: Three clearly separated eval modes:
+
+   | Metric Name | Temp | n | What It Measures | Use Case |
+   |-------------|------|---|------------------|----------|
+   | `greedy_pass@1` | 0.0 | 1 | Deterministic single-sample accuracy | Fast checkpoint comparison (primary) |
+   | `sampling_pass@8` | 0.6 | 8 | Majority-vote accuracy with diversity | More reliable final evaluation |
+   | `nondet_proxy_pass@8` | 0.0 | 8 | vLLM batching nondeterminism fragility | Diagnostics only (gap = fragile solutions) |
+
+   Attempt-26 used `nondet_proxy_pass@8` (temp=0, n=8) which conflates model quality with vLLM nondeterminism. Attempt-27 should use `greedy_pass@1` for fast evals and `sampling_pass@8` for final checkpoint comparison.
+
+4. **Dual probe set eval**: Use both probe sets for checkpoint selection:
+   - **ID probe** (`probe_set_200.jsonl`): Early stopping signal. If ID accuracy drops, training is unstable.
+   - **OOD probe** (`probe_set_200_ood.jsonl`, 170 MATH + 32 Apex): Primary generalization signal. Checkpoint selected by OOD probe EM + AIME sanity.
+   - **AIME** (18 problems): Sanity check only. Too small (1 problem = 5.6% swing) for reliable trend detection.
+
+5. **Stability improvements** (based on root cause analysis):
+   - **Lower `eps_clip`** from 0.2 → 0.1 to tighten PPO ratio clipping. This directly targets the root cause (extreme log-prob ratios). The escalating spike pattern (14.6 → 22.3 → 70.3 → 280.9 → 429.6 max grad_norm per decade) confirms the current eps_clip=0.2 allows too much policy shift.
+   - **Per-micro-batch gradient clipping**: Worth exploring — clip gradients after each micro-batch backward pass, not just after the full accumulation. This prevents a single extreme micro-batch from dominating the accumulated gradient.
+   - Advantage clipping NOT prioritized (advantages are normal during spikes).
+
+6. **Hyperparameter escalation ladder** (change one variable at a time):
+   - **First**: Tighten eps_clip 0.2 → 0.1 (directly targets ratio outliers)
+   - **If spikes persist**: Add KL coefficient 0.01 as seatbelt
+   - **If OOD probe is flat with tighter clipping**: Increase LR from 5e-7 → 1e-6
+   - **If ratio tail logs confirm extreme tails even with eps_clip=0.1**: Lower LR instead
+
+7. **Training horizon**: Based on attempt-26, step 30 is the sweet spot. Cap at ~30-40 steps with early stopping triggered by OOD probe degradation (2 consecutive eval drops).
+
+### 11.10.1 Attempt-27 Configuration
+
+**Script**: `train_grpo_20b_a27.sh`
+
+**Single training change**: `eps_clip` 0.2 → 0.1
+
+All other training hyperparameters are identical to attempt-26. Instrumentation-only changes (do not affect training dynamics):
+
+| Parameter | Attempt-26 | Attempt-27 | Type |
+|-----------|------------|------------|------|
+| `eps_clip` | 0.2 | **0.1** | **Training** |
+| `actor_learning_rate` | 5e-7 | 5e-7 | — |
+| `micro_train_batch_size` | 1 | 1 | — |
+| `n_samples_per_prompt` | 8 | 8 | — |
+| `generate_max_len` | 4096 | 4096 | — |
+| `rollout_batch_size` | 16 | 16 | — |
+| `train_batch_size` | 16 | 16 | — |
+| `lora_rank / alpha` | 32 / 64 | 32 / 64 | — |
+| `init_kl_coef` | 0.001 | 0.001 | — |
+| `max_norm` | 1.0 | 1.0 | — |
+| `eval_dataset` | AIME (18) | OOD probe (202) | Instrumentation |
+| `eval metric` | `nondet_proxy_pass@8` | `greedy_pass@1` | Instrumentation |
+| `eval_steps` | 10 | 5 | Instrumentation |
+| `save_steps` | 10 | 5 | Instrumentation |
+| `num_episodes` | 20 | 5 (~40 steps) | Instrumentation |
+
+**Eval schedule**:
+- **Built-in** (every 5 steps): `greedy_pass@1` on OOD probe (202 MATH+Apex problems, `temp=0, n=1`)
+- **Post-hoc** (on saved checkpoints): AIME (18 problems) + ID probe (200 problems) — run manually after training
+- **Early stopping**: If OOD `greedy_pass@1` drops for 2 consecutive evals (10 steps), stop training
+
+**New instrumentation active** (via patches):
+- Ratio tail logging: `log_ratio_max`, `log_ratio_raw_max`, `ratio_max`, `log_ratio_abs_p99` per step
+- Spike sample logging: prompt hashes dumped to `spike_log.jsonl` when `grad_norm > 50`
+
+**Output paths** (separate from attempt-26):
+- Checkpoints: `/mnt/data/rft_checkpoints/gpt-oss-20b-grpo-a27`
+- Metrics: `/mnt/scratch/rft_metrics_20b_a27/training_metrics.jsonl`
+- Spike log: `/mnt/scratch/rft_metrics_20b_a27/spike_log.jsonl`
+
+### 11.11 Lessons Learned (Shareable)
+
+**For others doing GRPO RL fine-tuning with MoE models:**
+
+1. **Grad norm spikes come from ratio outliers, not advantage outliers**: With GRPO + binary reward, we observed grad_norm spikes up to 430x the clip threshold. Initial hypothesis was advantage outliers, but data showed advantage stats are identical at spike and non-spike steps (adv_max ≈ 0.011 in both cases). The actual cause: individual tokens with extreme log-probability ratios (policy shifted far from reference). This means advantage clipping won't fix spikes — tighter PPO ratio clipping (`eps_clip`) or per-micro-batch gradient clipping are the correct interventions.
+
+2. **Spikes escalate over training but are individually harmless**: Over 52 steps, max grad_norm per decade escalated: 14.6 → 22.3 → 70.3 → 280.9 → 429.6. The model recovered within 1 step after every spike (post-clipping). However, the escalation pattern correlates with declining eval performance — suggesting that even clipped spikes inject noise that accumulates in LoRA parameters over many steps. The spike itself doesn't destroy the model, but the trend indicates the policy is drifting into regions where extreme ratios become more common.
+
+3. **Train/eval divergence is the key signal to stop**: Training correctness improved steadily (rolling avg 0.51 → 0.56) while held-out AIME pass@1 degraded (35.4% peak → 27.1%, below pre-training baseline). This is classic overfitting: the model learns to exploit the training distribution (NuminaMath) without generalizing to harder held-out problems (AIME). **An ID-only probe set would miss this.** Use separate ID and OOD probes.
+
+4. **Separate ID and OOD probe sets for different signals**:
+   - **ID probe** (from training pool): measures learning/stability. Good for early stopping on catastrophic collapse.
+   - **OOD probe** (MATH + Apex, disjoint from training pool): measures generalization. Good for checkpoint selection.
+   - **Tiny held-out set** (AIME, N=18): sanity check only. 1 problem = 5.6% swing — too noisy for trends.
+
+5. **Pre-clipping grad_norm is the metric to log, not post-clipping**: Logging the raw gradient norm before clipping tells you *how aggressive* the update would have been. Large values don't mean the model is damaged — they mean clipping is working. But the magnitude trend over training tells you whether the policy is diverging.
+
+6. **Step-to-step correctness is too noisy for trend detection**: With batch size 16 and 8 samples per prompt, each step evaluates ~128 samples from a random subset. One step can show 0.23, the next 0.72. Use 10-step rolling averages or a fixed probe set for reliable progress tracking.
+
+7. **MXFP4 MoE models need dtype casting before ZeRO-3**: MXFP4 dequantization leaves router/gate parameters as float32 while other parameters become bf16. ZeRO-3's all-gather requires uniform dtype. Cast all parameters to bf16 before `deepspeed.zero.Init()`.
+
+8. **Colocate actor and ref model when GPU budget is tight**: With `--colocate_actor_ref`, both share the same GPUs. The ref model only does forward passes (no gradients), so memory overhead is minimal with ZeRO-3.
+
+9. **Eval config matters: clearly label your metrics**: Three distinct eval modes exist and should never be conflated:
+   - `greedy_pass@1` (temp=0, n=1): deterministic single-sample accuracy
+   - `sampling_pass@8` (temp>0, n=8): majority-vote accuracy with diversity
+   - `nondet_proxy_pass@8` (temp=0, n=8): measures vLLM batching nondeterminism, NOT true pass@k. The gap between this and greedy_pass@1 reveals "fragile" solutions that depend on batch composition rather than model capability.
+
+10. **`has_boxed` is a format compliance proxy, not a reward signal**: Track it to detect if the model is losing the ability to produce `\boxed{}`, but don't over-optimize for it. The real signal is held-out eval accuracy.
+
+11. **KL ≈ 0 is expected with small `init_kl_coef` and early training**: With `init_kl_coef=0.001`, the KL penalty is negligible. The policy changes slowly with LR=5e-7 and LoRA rank=32. KL will grow as training progresses. If it stays near zero after 50+ steps, the LR may be too low.
+
+12. **The training horizon is shorter than you think**: With LoRA rank=32, LR=5e-7, and 50k training problems, the best checkpoint was at step 30 (~3 episodes through the data). Steps 40-50 showed declining generalization despite improving training metrics. Over-training LoRA adapters is easy — they have limited capacity and quickly memorize the training distribution. Plan for ~30-step runs and evaluate frequently.
+
+### 11.12 Theory: Why Gradient Spikes Escalate
+
+Based on attempt-26 data (52 steps), we propose the following mechanism for escalating gradient norm spikes in GRPO with LoRA:
+
+**The positive feedback loop:**
+
+```
+1. Policy shifts slightly from reference on some tokens
+   → log_ratio = log π(a|s) - log π_ref(a|s) grows
+2. Some prompts have tokens where the shift is large
+   → ratio = exp(log_ratio) becomes extreme (>>1 or <<1)
+3. Extreme ratios × advantages = large surrogate loss
+   → grad_norm spikes (pre-clipping)
+4. Clipping bounds the update, but the policy has still shifted
+   → On next encounter with similar prompts, ratios are even larger
+5. Go to step 2 with larger ratios → escalating spikes
+```
+
+**Why LoRA amplifies this**: LoRA's low-rank structure means a small number of parameters control a large number of token log-probabilities. A gradient update that shifts LoRA weights to improve one prompt can have outsized effects on token distributions for other prompts. This is a form of catastrophic interference at the token level.
+
+**Why `micro_train_batch_size=1` amplifies this**: Each micro-batch gradient comes from a single prompt's 8 samples. If that prompt has extreme ratios, its gradient dominates that micro-batch. With gradient accumulation across 16 micro-batches, one extreme prompt contributes 1/16 of the accumulated gradient — but if its gradient norm is 100x the others, it effectively contributes ~86% of the final gradient before clipping.
+
+**Interventions that target the root cause**:
+- **Tighter `eps_clip`** (0.2 → 0.1): Limits how much the ratio can contribute to the loss. Directly caps the feedback loop at step 2.
+- **Log-ratio clamping** ([-20, 20]): Already implemented. Prevents numerical overflow but doesn't prevent the ratios from being large within the clamped range.
+- **Per-micro-batch gradient clipping**: Clips after each micro-batch backward, not just after accumulation. Prevents a single extreme prompt from dominating.
+- **Lower LR**: Slows step 1 (policy shifts less per update), reducing the growth rate of the feedback loop.
+- **KL penalty**: Adds a cost for policy divergence, explicitly penalizing large log_ratios. Acts as a soft constraint on step 1.
+
+**Interventions that do NOT help**:
+- **Advantage clipping**: Advantages are identical at spike and non-spike steps. The problem is the ratio, not the advantage.
+- **Larger batch size** (without per-micro-batch clipping): More micro-batches dilute the extreme one, but with `micro_train_batch_size=1` and gradient accumulation, the extreme prompt's gradient is still fully computed and accumulated before clipping.

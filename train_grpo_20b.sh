@@ -9,7 +9,7 @@
 #   - LoRA: r=32, alpha=64 (attention-only, MoE-compatible)
 #
 # GPU allocation (8 GPUs total):
-#   - 4 GPUs for actor (LoRA training via DeepSpeed ZeRO-3, NO CPU offload)
+#   - 4 GPUs for actor + ref model colocated (LoRA training via DeepSpeed ZeRO-3, NO CPU offload)
 #   - 4 GPUs for vLLM rollout (2 engines × TP=2, MXFP4 inference)
 #
 # Memory: 84GB bf16 / 4 GPUs = 21GB/GPU for params, leaving ~59GB for
@@ -20,6 +20,9 @@
 #   bash train_grpo_20b.sh --num_episodes 100  # override any arg
 
 set -euo pipefail
+
+# Ensure Python output is unbuffered for real-time log monitoring
+export PYTHONUNBUFFERED=1
 
 # NCCL settings
 export NCCL_DEBUG=INFO
@@ -76,6 +79,9 @@ python -m openrlhf.cli.train_ppo_ray \
     --target_modules q_proj k_proj v_proj o_proj \
     --actor_num_nodes 1 \
     --actor_num_gpus_per_node 4 \
+    --colocate_actor_ref \
+    --ref_num_nodes 1 \
+    --ref_num_gpus_per_node 4 \
     --vllm_num_engines 2 \
     --vllm_tensor_parallel_size 2 \
     --vllm_gpu_memory_utilization 0.85 \

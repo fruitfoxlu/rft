@@ -94,6 +94,17 @@
 +            # sets ds_id on all params so deepspeed.initialize() skips both
 +            # module.to(device) and _broadcast_model(), avoiding GPU OOM.
 +            if _is_mxfp4_dequant and ds_config is not None and ds_config["zero_optimization"]["stage"] == 3:
++                # Force all parameters to bf16 before ZeRO-3 partitioning.
++                # MXFP4 dequantization may leave MoE gate/router params as float32,
++                # causing TypeError in ZeRO-3's all_gather during optimizer step.
++                _n_cast = 0
++                for _p in self.model.parameters():
++                    if _p.dtype != torch_dtype:
++                        _p.data = _p.data.to(torch_dtype)
++                        _n_cast += 1
++                if _n_cast > 0:
++                    print(f"[MXFP4] Cast {_n_cast} parameters to {torch_dtype} for ZeRO-3 dtype consistency")
++
 +                import torch.distributed as _dist
 +                if _dist.is_initialized():
 +                    deepspeed.zero.Init(module=self.model, config_dict_or_path=ds_config)

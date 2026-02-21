@@ -142,9 +142,40 @@ def reward_func(queries: list[str], prompts: list[str], labels: list[str]) -> di
     # Pure exact-match reward
     correctness = check_correctness(model_answer, label)
 
-    # Determine parse method for logging
+    # Determine parse method and boxed location for logging
     response_stripped = _strip_harmony_tokens(generation)
-    has_boxed = bool(re.search(r"\\boxed\{", response_stripped))
+    boxed_matches = list(re.finditer(r"\\boxed\{", response_stripped))
+    has_boxed = bool(boxed_matches)
+
+    # parse_method: how the answer was extracted (numeric for tensor compat)
+    # 2.0 = boxed, 1.0 = last_number fallback, 0.0 = none
+    if has_boxed:
+        parse_method = 2.0
+    elif model_answer:
+        parse_method = 1.0
+    else:
+        parse_method = 0.0
+
+    # boxed_in_final: 1.0 if last \boxed{} is in final 20% of response, 0.0 otherwise
+    if has_boxed and len(response_stripped) > 0:
+        last_boxed_start = boxed_matches[-1].start()
+        relative_pos = last_boxed_start / len(response_stripped)
+        boxed_in_final = 1.0 if relative_pos >= 0.8 else 0.0
+    else:
+        boxed_in_final = 0.0
+
+    # truncated_response: heuristic for whether the response was cut off
+    stripped_tail = response_stripped.rstrip()
+    is_very_long = len(response_stripped) > 3000
+    ends_mid_sentence = (
+        bool(stripped_tail)
+        and stripped_tail[-1] not in ".!?)}\n"
+        and not stripped_tail.endswith("$$")
+    )
+    truncated_response = 1.0 if (
+        (not has_boxed and is_very_long)
+        or ends_mid_sentence
+    ) else 0.0
 
     reward = float(correctness)
 
@@ -152,6 +183,9 @@ def reward_func(queries: list[str], prompts: list[str], labels: list[str]) -> di
         "correctness": float(correctness),
         "has_answer": 1.0 if model_answer else 0.0,
         "has_boxed": 1.0 if has_boxed else 0.0,
+        "parse_method": parse_method,
+        "boxed_in_final": boxed_in_final,
+        "truncated_response": truncated_response,
     }
 
     return {

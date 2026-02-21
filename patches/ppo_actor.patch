@@ -1,5 +1,5 @@
---- a/openrlhf/trainer/ray/ppo_actor.py	2026-02-05 12:33:06.000000000 +0000
-+++ b/openrlhf/trainer/ray/ppo_actor.py	2026-02-20 03:41:21.395654611 +0000
+--- openrlhf-0.9.3.data/purelib/openrlhf/trainer/ray/ppo_actor.py	2026-02-05 12:33:06.000000000 +0000
++++ /opt/conda/envs/rft/lib/python3.10/site-packages/openrlhf/trainer/ray/ppo_actor.py	2026-02-21 17:15:15.396809137 +0000
 @@ -136,15 +136,34 @@
                  )
                  for i, engine in enumerate(self.vllm_engines)
@@ -39,7 +39,96 @@
  
              ray.get(refs)
  
-@@ -318,25 +337,54 @@
+@@ -250,6 +269,16 @@
+         if vllm_kl is not None:
+             experience.info["vllm_kl"] = vllm_kl.detach()
+ 
++        # Ratio tail diagnostics (stored by PolicyLoss.forward)
++        if hasattr(self.actor_loss_fn, '_log_ratio_max'):
++            experience.info["log_ratio_max"] = torch.tensor([self.actor_loss_fn._log_ratio_max])
++            experience.info["log_ratio_min"] = torch.tensor([self.actor_loss_fn._log_ratio_min])
++            experience.info["log_ratio_raw_max"] = torch.tensor([self.actor_loss_fn._log_ratio_raw_max])
++            experience.info["log_ratio_raw_min"] = torch.tensor([self.actor_loss_fn._log_ratio_raw_min])
++            experience.info["ratio_max"] = torch.tensor([self.actor_loss_fn._ratio_max])
++            experience.info["log_ratio_abs_p99"] = torch.tensor([self.actor_loss_fn._log_ratio_abs_p99])
++            experience.info["tokens_in_batch"] = torch.tensor([float(self.actor_loss_fn._tokens_in_batch)])
++
+         if self.args.use_kl_loss:
+             if self.args.init_kl_coef > 0:
+                 kl = compute_approx_kl(
+@@ -299,6 +328,71 @@
+         status = {"policy_loss": actor_loss.detach().item(), "actor_lr": self.actor_scheduler.get_last_lr()[0]}
+         if self.args.entropy_loss_coef is not None:
+             status["entropy_loss"] = entropy_loss.detach().item()
++            # Entropy distribution stats (token-level)
++            ent = output.entropy[:, -experience.action_mask.shape[1]:]
++            ent_vals = ent[experience.action_mask.bool()].detach()
++            if ent_vals.numel() > 0:
++                status["entropy_mean"] = ent_vals.mean().item()
++                status["entropy_p10"] = ent_vals.quantile(0.1).item()
++                status["entropy_p90"] = ent_vals.quantile(0.9).item()
++
++        # Gradient norm from DeepSpeed engine (cached from step())
++        # Always add to status dict to avoid KeyError in micro-batch accumulation
++        grad_norm_val = 0.0
++        try:
++            ds_model = self.actor.model
++            if hasattr(ds_model, "get_global_grad_norm"):
++                gn = ds_model.get_global_grad_norm()
++                if gn is not None:
++                    grad_norm_val = float(gn)
++        except Exception:
++            pass
++        status["grad_norm"] = grad_norm_val
++
++        # Spike logging: dump prompt hashes when grad_norm exceeds threshold
++        SPIKE_THRESHOLD = 50.0
++        if grad_norm_val > SPIKE_THRESHOLD and torch.distributed.get_rank() == 0:
++            try:
++                import hashlib, json, time as _time
++                spike_log_path = os.environ.get("SPIKE_LOG_PATH", "/mnt/scratch/rft_metrics_20b/spike_log.jsonl")
++                # Extract prompt tokens (before action_mask starts) for each sample
++                # sequences: [batch, seq_len], action_mask: [batch, response_len]
++                seq = sequences.detach()
++                prompt_len = seq.shape[1] - action_mask.shape[1]
++                prompt_hashes = []
++                for i in range(seq.shape[0]):
++                    prompt_tokens = seq[i, :prompt_len].cpu().tolist()
++                    # Remove padding (0s) from the left
++                    prompt_tokens = [t for t in prompt_tokens if t != 0]
++                    h = hashlib.sha256(str(prompt_tokens).encode()).hexdigest()[:16]
++                    prompt_hashes.append(h)
++                # Deduplicate (all 8 samples from same prompt have same hash)
++                unique_hashes = list(dict.fromkeys(prompt_hashes))
++                spike_entry = {
++                    "timestamp": _time.time(),
++                    "grad_norm": grad_norm_val,
++                    "policy_loss": actor_loss.detach().item(),
++                    "prompt_hashes": unique_hashes,
++                    "n_samples": seq.shape[0],
++                    "prompt_len": prompt_len,
++                    "log_ratio_max": self.actor_loss_fn._log_ratio_max if hasattr(self.actor_loss_fn, '_log_ratio_max') else None,
++                    "log_ratio_raw_max": self.actor_loss_fn._log_ratio_raw_max if hasattr(self.actor_loss_fn, '_log_ratio_raw_max') else None,
++                }
++                with open(spike_log_path, "a") as f:
++                    f.write(json.dumps(spike_entry) + "\n")
++                print(f"[SPIKE] grad_norm={grad_norm_val:.1f} policy_loss={spike_entry['policy_loss']:.4f} "
++                      f"prompt_hashes={unique_hashes}", flush=True)
++            except Exception as e:
++                print(f"[WARN] Spike logging failed: {e}", flush=True)
++
++        # Advantage stats (per micro-batch)
++        adv_mask = experience.action_mask.bool()
++        adv_vals = advantages[adv_mask].detach().float()
++        if adv_vals.numel() > 0:
++            status["advantage_mean"] = adv_vals.mean().item()
++            status["advantage_std"] = adv_vals.std().item()
++            status["advantage_max"] = adv_vals.max().item()
++            status["advantage_min"] = adv_vals.min().item()
+ 
+         # merge logs from info field
+         for k, v in experience.info.items():
+@@ -318,25 +412,54 @@
  
          torch.cuda.empty_cache()
          model = self.actor.model.module
@@ -103,7 +192,7 @@
  
          def _handle_cuda_ipc(param, count, num_params):
              from torch.multiprocessing.reductions import reduce_tensor
-@@ -388,6 +436,81 @@
+@@ -388,6 +511,81 @@
                      with deepspeed.zero.GatheredParameters([param], enabled=self.strategy.args.zero_stage == 3):
                          _handle_cuda_ipc(param, count, num_params)
  

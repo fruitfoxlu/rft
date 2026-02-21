@@ -1,0 +1,59 @@
+--- openrlhf-0.9.3.data/purelib/openrlhf/models/loss.py	2026-02-05 12:33:06.000000000 +0000
++++ /opt/conda/envs/rft/lib/python3.10/site-packages/openrlhf/models/loss.py	2026-02-21 17:10:13.105047174 +0000
+@@ -120,7 +120,9 @@
+         rollout_log_probs: Optional[torch.Tensor] = None,
+     ) -> torch.Tensor:
+         if self.policy_loss_type == "ppo":
+-            log_ratio = log_probs - old_log_probs
++            log_ratio_raw = log_probs - old_log_probs
++            # Clamp log_ratio for numerical safety before exp()
++            log_ratio = log_ratio_raw.clamp(-20.0, 20.0)
+             ratio = log_ratio.exp()
+         elif self.policy_loss_type == "gspo":
+             # GSPO: https://arxiv.org/pdf/2507.18071
+@@ -179,6 +181,45 @@
+         )
+         clip_ratio = masked_mean(torch.lt(surr2, surr1).float(), action_mask, dim=None)
+         ppo_kl = masked_mean(-log_ratio.detach(), action_mask, dim=None)
++
++        # Store ratio tail stats for diagnostics (accessible via self after call)
++        with torch.no_grad():
++            if action_mask is not None:
++                # Use action_mask to exclude padding tokens
++                active_log_ratios = log_ratio.detach()[action_mask.bool()]
++                # Raw (pre-clamp) log ratios to see true tail magnitude
++                active_log_ratios_raw = log_ratio_raw.detach()[action_mask.bool()]
++                if active_log_ratios.numel() > 0:
++                    self._log_ratio_max = active_log_ratios.max().item()
++                    self._log_ratio_min = active_log_ratios.min().item()
++                    self._log_ratio_raw_max = active_log_ratios_raw.max().item()
++                    self._log_ratio_raw_min = active_log_ratios_raw.min().item()
++                    self._ratio_max = active_log_ratios.exp().max().item()
++                    abs_log_ratios = active_log_ratios.abs()
++                    p99_idx = int(0.99 * abs_log_ratios.numel())
++                    if p99_idx < abs_log_ratios.numel():
++                        self._log_ratio_abs_p99 = abs_log_ratios.sort().values[p99_idx].item()
++                    else:
++                        self._log_ratio_abs_p99 = abs_log_ratios.max().item()
++                    self._tokens_in_batch = active_log_ratios.numel()
++                else:
++                    self._log_ratio_max = 0.0
++                    self._log_ratio_min = 0.0
++                    self._log_ratio_raw_max = 0.0
++                    self._log_ratio_raw_min = 0.0
++                    self._ratio_max = 1.0
++                    self._log_ratio_abs_p99 = 0.0
++                    self._tokens_in_batch = 0
++            else:
++                active_log_ratios_raw = log_ratio_raw.detach()
++                self._log_ratio_max = log_ratio.detach().max().item()
++                self._log_ratio_min = log_ratio.detach().min().item()
++                self._log_ratio_raw_max = active_log_ratios_raw.max().item()
++                self._log_ratio_raw_min = active_log_ratios_raw.min().item()
++                self._ratio_max = ratio.detach().max().item()
++                self._log_ratio_abs_p99 = 0.0
++                self._tokens_in_batch = log_ratio.numel()
++
+         return loss, clip_ratio, ppo_kl, vllm_kl
+ 
+ 

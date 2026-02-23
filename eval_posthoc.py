@@ -1,20 +1,30 @@
 #!/usr/bin/env python3
-"""Post-hoc evaluation of RL checkpoints on ID probe, OOD probe, and AIME.
+"""Post-hoc evaluation of RL checkpoints on configurable eval sets.
 
-Strategy:
-1. Merge LoRA adapters into base model (CPU-only subprocess to avoid CUDA pollution)
-2. Start a vLLM server with each merged model (TP=2, MXFP4)
-3. Evaluate all problems via OpenAI-compatible API
-4. Stop server, repeat for next checkpoint
+Starts a vLLM server for each model, evaluates all problems via OpenAI API,
+prints a summary table. Supports both already-merged models and raw LoRA
+adapters (auto-detected by presence of adapter_config.json).
 
 Usage:
+    # Eval already-merged models on OOD-1000 + ID-200 + AIME-18
+    python eval_posthoc.py \
+      --model a30_step130=/mnt/scratch/merged_models/a30_step130 \
+      --model a30_step200=/mnt/scratch/merged_models/a30_step200 \
+      --eval ood1000=data/probe_set_1000_ood.jsonl \
+      --eval id200=data/probe_set_200.jsonl \
+      --eval aime=data/aime_eval.jsonl
+
+    # Defaults: 3 merged models × (OOD-1000 + ID-200 + AIME-18)
     python eval_posthoc.py
+
+    # Include base model
     python eval_posthoc.py --include-base
 """
 
 import argparse
 import gc
 import json
+import math
 import os
 import subprocess
 import sys
@@ -29,20 +39,27 @@ from reward_func_em import extract_model_answer, check_correctness
 DATA_DIR = SCRIPT_DIR / "data"
 BASE_MODEL = "openai/gpt-oss-20b"
 
-EVAL_SETS = {
-    "id_probe": DATA_DIR / "probe_set_200.jsonl",
-    "ood_probe": DATA_DIR / "probe_set_200_ood.jsonl",
-    "aime": DATA_DIR / "aime_eval.jsonl",
+DEFAULT_MODELS = {
+    "a29b_step200": "/mnt/scratch/merged_models/a29b_step200",
+    "a30_step130": "/mnt/scratch/merged_models/a30_step130",
+    "a30_step200": "/mnt/scratch/merged_models/a30_step200",
 }
 
-DEFAULT_CHECKPOINTS = {
-    "a29a_step200": "/mnt/data/rft_checkpoints/gpt-oss-20b-grpo-a29a/global_step200_hf",
-    "a29b_step80": "/mnt/data/rft_checkpoints/gpt-oss-20b-grpo-a29b/global_step80_hf",
+DEFAULT_EVALS = {
+    "ood1000": str(DATA_DIR / "probe_set_1000_ood.jsonl"),
+    "id200": str(DATA_DIR / "probe_set_200.jsonl"),
+    "aime": str(DATA_DIR / "aime_eval.jsonl"),
+}
+
+# Adapter-to-merged model mapping for auto-merge
+ADAPTER_CHECKPOINTS = {
     "a29b_step200": "/mnt/data/rft_checkpoints/gpt-oss-20b-grpo-a29b/global_step200_hf",
+    "a30_step130": "/mnt/data/rft_checkpoints/gpt-oss-20b-grpo-a30/global_step130_hf",
+    "a30_step200": "/mnt/data/rft_checkpoints/gpt-oss-20b-grpo-a30/global_step200_hf",
 }
 
 
-def load_problems(path: Path) -> list[dict]:
+def load_problems(path: str) -> list[dict]:
     problems = []
     with open(path) as f:
         for line in f:
@@ -75,7 +92,6 @@ print("  Saving merged model to {output_dir}...", flush=True)
 os.makedirs("{output_dir}", exist_ok=True)
 model.save_pretrained("{output_dir}")
 tokenizer.save_pretrained("{output_dir}")
-# Note: quantization_config is preserved — MLP expert weights remain MXFP4
 
 del model
 gc.collect()
@@ -101,11 +117,10 @@ def start_vllm_server(model_path: str, tp: int = 2, port: int = 8000,
         "--port", str(port),
         "--trust-remote-code",
     ]
-    print(f"  Starting vLLM: {' '.join(cmd)}")
-    # Redirect to file to avoid pipe buffer deadlock
+    print(f"  Starting vLLM: {' '.join(cmd)}", flush=True)
     log_file = open(os.path.join(log_dir, "vllm_server.log"), "w")
     proc = subprocess.Popen(cmd, stdout=log_file, stderr=subprocess.STDOUT)
-    proc._log_file = log_file  # keep reference to close later
+    proc._log_file = log_file
     return proc
 
 
@@ -118,7 +133,7 @@ def wait_for_server(base_url: str, timeout: int = 300) -> bool:
             client = OpenAI(base_url=base_url, api_key="unused")
             models = client.models.list()
             if models.data:
-                print(f"  Server ready: {models.data[0].id}")
+                print(f"  Server ready: {models.data[0].id}", flush=True)
                 return True
         except Exception:
             pass
@@ -141,7 +156,7 @@ def stop_server(proc: subprocess.Popen):
 
 def eval_via_api(base_url: str, model_name: str, problems: list[dict],
                  max_tokens: int, label: str) -> tuple[float, list[dict]]:
-    """Evaluate using OpenAI-compatible API."""
+    """Evaluate using OpenAI-compatible API (greedy, temp=0, n=1)."""
     from openai import OpenAI
 
     client = OpenAI(base_url=base_url, api_key="unused")
@@ -161,7 +176,7 @@ def eval_via_api(base_url: str, model_name: str, problems: list[dict],
                 text = response.choices[0].message.content or ""
                 break
             except Exception as e:
-                print(f"  [{label}] Error (attempt {attempt + 1}): {e}")
+                print(f"  [{label}] Error (attempt {attempt + 1}): {e}", flush=True)
                 time.sleep(2 * (attempt + 1))
                 text = ""
 
@@ -177,14 +192,24 @@ def eval_via_api(base_url: str, model_name: str, problems: list[dict],
 
         if (i + 1) % 50 == 0 or i == len(problems) - 1:
             print(f"  [{label}] {i+1}/{len(problems)}: "
-                  f"{correct_count:.0f}/{i+1} = {correct_count/(i+1)*100:.1f}%")
+                  f"{correct_count:.0f}/{i+1} = {correct_count/(i+1)*100:.1f}%",
+                  flush=True)
 
     accuracy = correct_count / len(problems) if problems else 0
     return accuracy, results
 
 
 def main():
-    parser = argparse.ArgumentParser(description="Post-hoc RL checkpoint evaluation")
+    parser = argparse.ArgumentParser(
+        description="Post-hoc RL checkpoint evaluation",
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+    )
+    parser.add_argument("--model", action="append", metavar="NAME=PATH",
+                        help="Model to evaluate: name=model_dir (repeatable). "
+                             "If model_dir contains adapter_config.json, auto-merges first.")
+    parser.add_argument("--eval", action="append", metavar="NAME=PATH",
+                        help="Eval set: name=path (repeatable). "
+                             "Default: ood1000 + id200 + aime.")
     parser.add_argument("--include-base", action="store_true",
                         help="Also eval base model (no LoRA)")
     parser.add_argument("--tp", type=int, default=2, help="Tensor parallel size")
@@ -193,50 +218,97 @@ def main():
                         default="/mnt/scratch/posthoc_eval_results.json")
     parser.add_argument("--max-tokens", type=int, default=4096)
     parser.add_argument("--merged-dir", type=str, default="/mnt/scratch/merged_models",
-                        help="Directory for merged models")
+                        help="Directory for auto-merged models")
     args = parser.parse_args()
 
-    checkpoints = DEFAULT_CHECKPOINTS
+    # Parse --model flags
+    models = {}
+    if args.model:
+        for spec in args.model:
+            if "=" not in spec:
+                raise ValueError(f"Invalid --model spec: {spec}. Use name=path format.")
+            name, path = spec.split("=", 1)
+            models[name] = path
+    else:
+        models = dict(DEFAULT_MODELS)
+
+    # Parse --eval flags
+    eval_sets = {}
+    if args.eval:
+        for spec in args.eval:
+            if "=" not in spec:
+                raise ValueError(f"Invalid --eval spec: {spec}. Use name=path format.")
+            name, path = spec.split("=", 1)
+            eval_sets[name] = path
+    else:
+        eval_sets = dict(DEFAULT_EVALS)
+
     base_url = f"http://localhost:{args.port}/v1"
 
-    # Validate
-    for name, path in checkpoints.items():
-        assert os.path.exists(path), f"Checkpoint {name} not found: {path}"
-    for name, path in EVAL_SETS.items():
-        assert path.exists(), f"Eval set {name} not found: {path}"
-        print(f"  Eval set: {name} = {len(load_problems(path))} problems")
+    # Validate models
+    for name, path in models.items():
+        if not os.path.exists(path):
+            # Check if it's a raw adapter that needs merging
+            if name in ADAPTER_CHECKPOINTS and os.path.exists(ADAPTER_CHECKPOINTS[name]):
+                print(f"  {name}: model dir not found, will auto-merge from adapter", flush=True)
+            else:
+                raise FileNotFoundError(f"Model {name} not found: {path}")
+
+    # Validate eval sets
+    for name, path in eval_sets.items():
+        if not os.path.exists(path):
+            raise FileNotFoundError(f"Eval set {name} not found: {path}")
 
     # Load all problem sets once
     all_problems = {}
-    for eval_name, eval_path in EVAL_SETS.items():
+    for eval_name, eval_path in eval_sets.items():
         all_problems[eval_name] = load_problems(eval_path)
+        n = len(all_problems[eval_name])
+        print(f"  Eval set: {eval_name} = {n} problems ({Path(eval_path).name})", flush=True)
 
     all_results = {}
     os.makedirs(args.merged_dir, exist_ok=True)
 
-    # --- Step 1: Merge all checkpoints (CPU-only subprocesses) ---
-    print(f"\n{'='*60}")
-    print("STEP 1: Merging LoRA checkpoints")
-    print(f"{'='*60}")
-    for ckpt_name, ckpt_path in checkpoints.items():
-        merged_path = os.path.join(args.merged_dir, ckpt_name)
-        if os.path.exists(os.path.join(merged_path, "config.json")):
-            print(f"  {ckpt_name}: already merged (cached)")
+    # --- Step 1: Auto-merge any adapters that need it ---
+    for model_name, model_path in models.items():
+        if os.path.exists(os.path.join(model_path, "config.json")):
+            print(f"  {model_name}: ready (merged model found)", flush=True)
             continue
-        print(f"  Merging {ckpt_name}...")
-        t0 = time.time()
-        merge_checkpoint_subprocess(BASE_MODEL, ckpt_path, merged_path)
-        print(f"  {ckpt_name}: merged in {time.time() - t0:.1f}s")
+        if os.path.exists(os.path.join(model_path, "adapter_config.json")):
+            # Raw adapter — merge it
+            merged_path = os.path.join(args.merged_dir, model_name)
+            if os.path.exists(os.path.join(merged_path, "config.json")):
+                print(f"  {model_name}: already merged (cached at {merged_path})", flush=True)
+                models[model_name] = merged_path
+                continue
+            print(f"  {model_name}: merging adapter...", flush=True)
+            t0 = time.time()
+            merge_checkpoint_subprocess(BASE_MODEL, model_path, merged_path)
+            print(f"  {model_name}: merged in {time.time() - t0:.1f}s", flush=True)
+            models[model_name] = merged_path
+        elif model_name in ADAPTER_CHECKPOINTS and not os.path.exists(model_path):
+            # Model dir missing but we know the adapter path
+            adapter_path = ADAPTER_CHECKPOINTS[model_name]
+            merged_path = os.path.join(args.merged_dir, model_name)
+            if os.path.exists(os.path.join(merged_path, "config.json")):
+                print(f"  {model_name}: already merged (cached at {merged_path})", flush=True)
+                models[model_name] = merged_path
+                continue
+            print(f"  {model_name}: merging from {adapter_path}...", flush=True)
+            t0 = time.time()
+            merge_checkpoint_subprocess(BASE_MODEL, adapter_path, merged_path)
+            print(f"  {model_name}: merged in {time.time() - t0:.1f}s", flush=True)
+            models[model_name] = merged_path
 
     # --- Step 2: Base model eval ---
     if args.include_base:
-        print(f"\n{'='*60}")
-        print(f"EVALUATING: BASE MODEL (no LoRA)")
-        print(f"{'='*60}")
+        print(f"\n{'='*60}", flush=True)
+        print(f"EVALUATING: BASE MODEL (no LoRA)", flush=True)
+        print(f"{'='*60}", flush=True)
 
         proc = start_vllm_server(BASE_MODEL, tp=args.tp, port=args.port)
         if not wait_for_server(base_url, timeout=300):
-            print("ERROR: vLLM server did not start for base model")
+            print("ERROR: vLLM server did not start for base model", flush=True)
             stop_server(proc)
             sys.exit(1)
 
@@ -253,67 +325,82 @@ def main():
                 "correct": sum(r["correct"] for r in details),
                 "elapsed_s": round(elapsed, 1),
             }
-            print(f"  -> {eval_name}: {acc*100:.2f}% [{elapsed:.1f}s]")
+            print(f"  -> {eval_name}: {acc*100:.2f}% ({sum(r['correct'] for r in details)}/{len(problems)}) [{elapsed:.1f}s]", flush=True)
 
         stop_server(proc)
         time.sleep(5)
 
-    # --- Step 3: Checkpoint evals ---
-    for ckpt_name, ckpt_path in checkpoints.items():
-        merged_path = os.path.join(args.merged_dir, ckpt_name)
-        print(f"\n{'='*60}")
-        print(f"EVALUATING: {ckpt_name}")
-        print(f"  Merged model: {merged_path}")
-        print(f"{'='*60}")
+    # --- Step 3: Model evals ---
+    for model_name, model_path in models.items():
+        print(f"\n{'='*60}", flush=True)
+        print(f"EVALUATING: {model_name}", flush=True)
+        print(f"  Model path: {model_path}", flush=True)
+        print(f"{'='*60}", flush=True)
 
-        proc = start_vllm_server(merged_path, tp=args.tp, port=args.port)
+        proc = start_vllm_server(model_path, tp=args.tp, port=args.port)
         if not wait_for_server(base_url, timeout=300):
-            print(f"ERROR: vLLM server did not start for {ckpt_name}")
+            print(f"ERROR: vLLM server did not start for {model_name}", flush=True)
             stop_server(proc)
             continue
 
-        all_results[ckpt_name] = {}
+        all_results[model_name] = {}
         for eval_name, problems in all_problems.items():
             t0 = time.time()
             acc, details = eval_via_api(
-                base_url, merged_path, problems,
-                max_tokens=args.max_tokens, label=f"{ckpt_name}/{eval_name}",
+                base_url, model_path, problems,
+                max_tokens=args.max_tokens, label=f"{model_name}/{eval_name}",
             )
             elapsed = time.time() - t0
-            all_results[ckpt_name][eval_name] = {
+            n_correct = sum(r["correct"] for r in details)
+            all_results[model_name][eval_name] = {
                 "accuracy": acc, "n_problems": len(problems),
-                "correct": sum(r["correct"] for r in details),
+                "correct": n_correct,
                 "elapsed_s": round(elapsed, 1),
             }
-            print(f"  -> {eval_name}: {acc*100:.2f}% [{elapsed:.1f}s]")
+            print(f"  -> {eval_name}: {acc*100:.2f}% ({n_correct}/{len(problems)}) [{elapsed:.1f}s]", flush=True)
 
         stop_server(proc)
         time.sleep(5)
 
     # --- Summary ---
-    print(f"\n{'='*80}")
-    print(f"SUMMARY TABLE")
-    print(f"{'='*80}")
-    print(f"{'Model':<20} {'ID(200)':>10} {'OOD(202)':>10} {'AIME(18)':>10}")
-    print("-" * 55)
+    print(f"\n{'='*80}", flush=True)
+    print(f"SUMMARY TABLE", flush=True)
+    print(f"{'='*80}", flush=True)
+
+    # Build header from eval set names and sizes
+    header = f"{'Model':<20}"
+    eval_names = list(eval_sets.keys())
+    for eval_name in eval_names:
+        n = len(all_problems[eval_name])
+        col = f"{eval_name}({n})"
+        header += f" {col:>16}"
+    print(header, flush=True)
+    print("-" * (20 + 17 * len(eval_names)), flush=True)
+
     for model_name in all_results:
         row = f"{model_name:<20}"
-        for eval_name in ["id_probe", "ood_probe", "aime"]:
+        for eval_name in eval_names:
             if eval_name in all_results[model_name]:
-                acc = all_results[model_name][eval_name]["accuracy"] * 100
-                row += f" {acc:>9.2f}%"
+                r = all_results[model_name][eval_name]
+                acc = r["accuracy"] * 100
+                correct = r["correct"]
+                n = r["n_problems"]
+                row += f" {acc:>6.2f}% ({correct:>3}/{n})"
             else:
-                row += f" {'--':>10}"
-        print(row)
+                row += f" {'--':>16}"
+        print(row, flush=True)
 
-    print(f"\nNote: SE ≈ sqrt(p(1-p)/N) at p~0.65:")
-    print(f"  ID (N=200):  SE=3.4%, 95% CI ≈ ±6.7pp")
-    print(f"  OOD (N=202): SE=3.4%, 95% CI ≈ ±6.6pp")
-    print(f"  AIME (N=18): SE=11.2%, 95% CI ≈ ±22pp (sanity only)")
+    # Statistical notes
+    p_est = 0.65
+    print(f"\nStatistical notes (SE at p≈{p_est}):", flush=True)
+    for eval_name in eval_names:
+        n = len(all_problems[eval_name])
+        se = math.sqrt(p_est * (1 - p_est) / n) * 100
+        print(f"  {eval_name} (N={n}): SE={se:.1f}%, 95% CI ≈ ±{1.96*se:.1f}pp", flush=True)
 
     with open(args.output, "w") as f:
         json.dump(all_results, f, indent=2)
-    print(f"\nResults saved to {args.output}")
+    print(f"\nResults saved to {args.output}", flush=True)
 
 
 if __name__ == "__main__":

@@ -1763,70 +1763,114 @@ All pairwise differences are within sampling noise. No statistically significant
 
 **Lesson #21**: When comparing hyperparameter changes, post-hoc eval on multiple checkpoints (best + final) with identical settings is essential. In-training eval curves are noisy (±3pp step-to-step), and comparing single checkpoints at the same step number can be misleading. Compare best-vs-best and final-vs-final to separate the hyperparameter effect from checkpoint selection noise.
 
-### 11.24 Experiment SOP v2: STOP vs DEBUG Decision Framework
+### 11.24 Experiment SOP v2.1-final: STOP vs DEBUG Decision Framework
 
-**Purpose**: Prevent self-deception and wasted compute by defining mechanical criteria for when to declare success (STOP-1) vs when to switch to structured debugging (STOP-3).
+**Purpose**: Prevent self-deception and wasted compute by defining mechanical criteria for when to declare success (STOP-1) vs when to switch to structured debugging (STOP-3). v2.1-final adds staged Gate-1a/1b, pool-variance STOP-3b clause, pipeline integrity preflight, and calibrated early-stop thresholds.
 
-#### Constants (fixed across all comparisons)
+#### 0) Baselines (lock these down for A31+)
 
-- **Primary metric**: OOD-1000 greedy_pass@1 (temp=0, n=1)
-  - Dataset: `data/probe_set_1000_ood.jsonl` (SHA256: `5700782fa9a6b5f0...`)
-  - Parsing: `reward_func_em.py` (boxed → last_number fallback → integer normalization)
-  - SE ≈ 1.5% at p≈0.65, 95% CI ≈ ±3.0pp
-- **Secondary**: ID-200 greedy_pass@1 (stability/regression check)
-- **Sanity only**: AIME-18 (SE≈11%, do NOT use for decisions)
-- **Provenance**: Every run records git SHA, patch SHAs, dataset SHA256, pool SHA256, seeds, exact eval commands
+Maintain two baselines, evaluated with the **same** eval pipeline + decoding:
 
-#### STOP-1: Performance Win (staged, compute-aware)
+- **Baseline-S0 (Step-0 Base Model)**: `openai/gpt-oss-20b` with no LoRA, evaluated once per attempt to guard against silent eval/pipeline drift. Stored as `eval/baseline_s0_ood1000.json`.
+- **Baseline-SOTA (Pinned Best Checkpoint)**: current best checkpoint (initially `A30_step130`), pinned by path. Update this pin **only** when a new attempt passes STOP-1 Gate-1b + Gate-2. Stored as `eval/baseline_sota_ood1000.json`.
 
-**Gate-1** (after Run-1):
-- Paired Δ on OOD-1000 ≥ +3pp vs current baseline checkpoint
-- McNemar exact p < 0.05 (or bootstrap 95% CI lower bound > 0)
-- Keep paired per-problem records (qid/hash, correct_baseline, correct_new, model_output) for post-hoc analysis
-- If Gate-1 passes → launch confirmation run
+#### 1) Constants and Statistical Reporting
 
-**Gate-2** (after confirmation run):
-- Rerun with different seed (same pool, same config) — tests training stochasticity
-- Both deltas > 0 and mean Δ ≥ +3pp → declare **STOP-1**
-- If mean Δ ≥ +4pp → declare **STOP-1 (gold win)**
-- Optional robustness: different pool subsample (tests data sensitivity) — not required for STOP-1
+**Primary metric**: OOD-1000 greedy_pass@1 (temp=0, n=1)
+- Dataset: `data/probe_set_1000_ood.jsonl` (SHA256: `5700782fa9a6b5f0...`)
+- Parsing: `reward_func_em.py` (boxed → last_number fallback → integer normalization)
+- SE ≈ 1.5% at p≈0.65, 95% CI ≈ ±3.0pp
 
-**No-regression check**: ID-200 must not worsen by > 3pp in either run.
+**Secondary**: ID-200 greedy_pass@1 (stability/regression check)
 
-#### Checkpoint Selection (bias control)
+**Sanity only**: AIME-18 (SE≈11%, do NOT use for decisions)
 
-Evaluate exactly **K=3 fixed checkpoints** per run on OOD-1000:
+**Canonical reporting (required for every Primary comparison)**:
+- `Δ = acc(new) - acc(baseline)` (percentage points)
+- Discordant counts: `b = # (baseline correct, new wrong)`, `c = # (baseline wrong, new correct)`
+- McNemar exact p-value on (b, c)
+- Recommended: paired bootstrap 95% CI for Δ (resample problems with replacement)
+- All computed from paired per-problem record: `eval/paired_records_{baseline}_{new}_ood1000.jsonl`
+  - Format: one line per problem: `{problem_hash, y_baseline, y_new, output_baseline, output_new}`
+
+#### 2) STOP-1: Performance Win (staged gates)
+
+**Gate-1a (Exploration gate: "worth confirming")**:
+- OOD-1000 Δ ≥ +2.0pp AND one of:
+  - McNemar exact p < 0.10, OR
+  - Paired bootstrap CI lower bound > -0.5pp
+- If Gate-1a passes → launch confirmation run with different seed
+- Rationale: prevents burning a second seed on clearly-flat runs
+
+**Gate-1b (Win gate: "claimable effect")**:
+- OOD-1000 Δ ≥ +3.0pp AND McNemar exact p < 0.05
+- Bootstrap CI lower bound > 0 (if computed)
+
+**Gate-2 (Replication)**:
+- Rerun with different seed (same pool SHA256, same config)
+- STOP-1 passes only if:
+  - Both seeds have Δ > 0
+  - Mean Δ across seeds ≥ +3.0pp (or ≥ +4.0pp for "gold win")
+- ID regression guardrail:
+  - ID-200 must not regress by > -3.0pp vs Baseline-S0
+  - Exception: if OOD-1000 mean Δ ≥ +6.0pp, allow up to -5.0pp ID regression (must be explicitly reported)
+
+If STOP-1 passes: freeze attempt as release candidate, start writeup.
+
+#### 3) Checkpoint Selection (K=3 fixed, no p-hacking)
+
+Evaluate exactly **K=3 checkpoints** per run on OOD-1000:
 1. **Final** (last step)
-2. **Mid** (halfway through training)
-3. **Best-by-inrun-OOD202** (best smoothed in-training OOD-202 score, 3-point moving average)
+2. **Mid** (predefined, e.g., step 100 for 200-step run or step 200 for 400-step run)
+3. **Best-by-monitor** (best smoothed OOD-202 during training, 3-point moving average)
 
-Always report all K results. No "evaluate 20 checkpoints and pick the best" without multiple-testing correction.
+Always report all K results. Do not evaluate 20 checkpoints and pick the max. If more resolution is needed, pre-register the additional checkpoints before looking at Primary results and report K.
 
-#### Early Stopping Within a Run
+#### 4) Early Stopping Within a Run
 
-Use smoothed OOD-202 (3-point moving average over eval steps) with patience:
-- If smoothed OOD-202 has not exceeded (best + 0.5pp) for 50 consecutive global steps → consider stopping early
-- Still evaluate the K=3 fixed checkpoints on OOD-1000 for the final run summary
-- This saves compute by avoiding the cosine LR over-decay problem observed in A30 (peak at step 130/200)
+Training-time OOD-202 is for monitoring/early stop only, not publishable claims.
 
-#### Pre-Fault-Tree: Parser/Eval Ceiling Check
+- Use smoothed OOD-202 (3-eval moving average)
+- **Patience**: 5 eval points (e.g., if eval_steps=10 → patience ≈ 50 global steps)
+- **Minimum improvement threshold**: +1.0pp over best-so-far smoothed OOD-202
+- If no improvement ≥ threshold within patience → stop and proceed to post-hoc OOD-1000 eval on K=3 checkpoints
+- Rationale: OOD-202 SE≈3.4%, so +0.5pp is within single-problem noise. +1.0pp (≈2 problems) with smoothing is a better balance.
+
+#### 5) STOP-3: Diminishing Returns (two flavors)
+
+**STOP-3a (Same-pool stagnation)**:
+- 2 consecutive single-variable attempts with **same pool SHA256** show:
+  - OOD-1000 Δ < +1.0pp AND CI includes 0 (or McNemar not significant)
+- Use a 3rd run only if results are in the gray zone (+1pp to +3pp, ambiguous CI)
+
+**STOP-3b (Pool-variance stagnation)**:
+- For experiments that necessarily change the pool (e.g., pool size 3200→6400):
+  - Under the same recipe (same hyperparams, only pool subsample differs), 2 different pool subsamples (different SHA256, same size and selection method) both show:
+    - OOD-1000 Δ < +1.0pp AND CI includes 0
+- Rationale: distinguishes "no effect" from "pool sensitivity"; prevents infinite running where STOP-3a never triggers due to forced pool changes
+
+When STOP-3 triggers (either a or b) → enter Debug Workflow (fault tree).
+
+#### 6) Pipeline Integrity Preflight
+
+**Mandatory** if an attempt changes anything in: eval path, parsing, vLLM weight-sync, LoRA application, decoding, or metrics serialization.
+
+Before running the full attempt:
+1. Pick one checkpoint (or step-0 base) and one dataset (OOD-202 is fine)
+2. Run in-training eval and post-hoc eval with identical settings
+3. Requirement: results must match exactly (or differ only by an explicitly documented nondeterminism source)
+
+This is separate from the parser ceiling check and prevents pipeline inflation/deflation bugs (cf. §11.22 LoRA accumulation bug).
+
+#### 7) Parser Ceiling Check
 
 After each run, before entering the fault tree:
 1. Sample 50 "incorrect" OOD-1000 cases from the best checkpoint
-2. Manually verify parsing: did `extract_model_answer()` extract the right answer?
+2. Manually verify: answer extraction correctness (boxed/last-number), normalization (fractions, negatives, units)
 3. If mis-parse rate > 5% → fix parser/format first, re-evaluate, before attributing lack of gains to the model
 4. Track parse_method distribution (boxed vs last_number vs none) per run
 
-#### STOP-3: Diminishing Returns Trigger
-
-**Trigger**: 2 consecutive clean single-variable runs with:
-- OOD-1000 Δ < +1pp AND bootstrap 95% CI includes 0
-
-Use a 3rd run only if results are in the gray zone (+1pp to +3pp, ambiguous CI).
-
-When STOP-3 triggers → enter Debug Workflow (fault tree below).
-
-#### Debug Workflow: Fault Tree
+#### 8) Debug Workflow: Fault Tree
 
 When STOP-3 triggers, classify the bottleneck and choose the next single-variable intervention.
 
@@ -1877,23 +1921,25 @@ When STOP-3 triggers, classify the bottleneck and choose the next single-variabl
 - Check if peak performance step correlates with LR level
 
 *Interventions*:
-- Increase min_lr (0.1×target → 0.2×target) — directly addresses A30 observation
+- Increase min_lr (0.1×target → 0.2×target) — directly addresses A30 observation (peak at step 130/200)
 - Adjust KL coefficient (init_kl_coef) — separate A/B
 
-#### Deliverables After Each Run
+#### 9) Deliverables Per Attempt (one-page summary)
 
-One-page summary containing:
-1. Config diff (single variable changed)
-2. Best checkpoint selection (K=3 results on OOD-1000)
-3. OOD-1000 and ID-200 results with Δ vs baseline and 95% CI
-4. Stability stats (spike count, ratio tail trend)
-5. Parser ceiling check (50-case manual review)
-6. Decision: **STOP-1 achieved** / **Continue** (next planned run) / **STOP-3 triggered** (enter debug, selected bottleneck class)
+1. Recipe diff (single variable changed)
+2. Training pool SHA256 + probe set SHA256
+3. Decoding settings (temp, n, max_tokens)
+4. Primary (OOD-1000) baselines + new checkpoint metrics (K=3)
+5. Paired stats: Δ, b/c, McNemar p-value (+ bootstrap CI if available)
+6. Stability metrics: spike count, max grad_norm, ratio tail indicators
+7. Parser ceiling check (50-case manual review)
+8. Decision: **STOP-1** (Gate-1a/1b/2 status) / **Continue** / **STOP-3a/3b** / **DEBUG** (selected bottleneck class)
 
-#### Operational Rules
+#### 10) Operational Rules
 
 1. **One variable per run.** If you change pool size, do not change LR/KL/rank.
 2. **Same eval pipeline.** OOD-1000 post-hoc eval selects checkpoints; OOD-202 is in-run monitoring only.
-3. **Full provenance.** Git SHA, all dataset SHA256s, seeds, exact commands — in the run summary.
+3. **Full provenance.** Git SHA, all dataset SHA256s, seeds, exact commands — in every run summary.
 4. **No data leakage.** Verify disjoint-by-hash (pool vs OOD-1000, pool vs ID-200) before every run.
 5. **Save model outputs.** Full generation text for all OOD-1000 problems (not just correct/incorrect) for post-hoc analysis.
+6. **Pipeline preflight.** After any eval/pipeline change, run regression check before full attempt.

@@ -1654,3 +1654,74 @@ Since `delta_N` is the complete LoRA correction (not an increment), the correct 
 - **Verdict**: micro_train_batch_size=2 is viable. Proceed with full attempt-30.
 
 **Lesson #19**: Doubling micro_train_batch_size from 1→2 in this setup does not cause OOM and actually reduces training time by ~18% (fewer micro-batch forward/backward passes, better GPU utilization). The previous cache flush warnings with micro=1 disappear, suggesting micro=1 was suboptimal for GPU memory management.
+
+### 11.21 Attempt-30: micro_train_batch_size=2 (Complete)
+
+**Status**: Complete. 200 global steps, 2026-02-23 06:21 → 13:54 (7.4 hours wall time).
+
+**Config**: Identical to A29B except micro_train_batch_size: 1 → 2. Script: `train_grpo_20b_a30.sh`.
+
+**Step timing**: median 114s/step (~18% faster than A29B's ~140s), confirming profile results.
+
+**OOD Eval Trajectory (N=202, greedy@1)**:
+
+| Step | A30 (FIXED) | A29B (BUGGY) | Delta |
+|------|-------------|--------------|-------|
+| 10 | 63.4% | 65.8% | -2.4pp |
+| 20 | 63.6% | 63.4% | +0.2pp |
+| 30 | 66.2% | 62.6% | +3.6pp |
+| 40 | 62.1% | 63.8% | -1.7pp |
+| 50 | 66.1% | 61.8% | +4.4pp |
+| 60 | 64.2% | 65.3% | -1.1pp |
+| 70 | 63.5% | 65.1% | -1.6pp |
+| 80 | 64.7% | 67.1% | -2.4pp |
+| 90 | 62.8% | 65.7% | -2.9pp |
+| 100 | 66.4% | 64.1% | +2.3pp |
+| 110 | 64.4% | 63.9% | +0.5pp |
+| 120 | 62.9% | 63.3% | -0.4pp |
+| 130 | 66.5% | 63.5% | +3.0pp |
+| 140 | 63.9% | 64.5% | -0.6pp |
+| 150 | 65.3% | 64.1% | +1.2pp |
+| 160 | 65.7% | 67.0% | -1.4pp |
+| 170 | 64.2% | 65.2% | -1.0pp |
+| 180 | 65.2% | 63.3% | +1.9pp |
+| 190 | 64.7% | 63.9% | +0.8pp |
+| 200 | 65.5% | 64.7% | +0.9pp |
+
+**Full-run summary**:
+- A30 mean OOD: **64.57%** (range 62.1–66.5%)
+- A29B mean OOD: 64.40% (range 61.8–67.1%)
+- Delta: +0.17pp (not significant)
+
+Note: A29B used BUGGY rollout generation and eval (accumulated LoRA weights). A30 is the first run with correct pipeline. Direct comparison is confounded by the bug fix.
+
+**Training metrics by quarter**:
+
+| Quarter | Reward | Grad Norm | Loss | Entropy | Spikes>50 |
+|---------|--------|-----------|------|---------|-----------|
+| Steps 1-50 | 0.539 | 12.89 | 0.027 | 1.307 | 2 |
+| Steps 51-100 | 0.513 | 11.30 | 0.009 | 1.317 | 2 |
+| Steps 101-150 | 0.537 | 20.27 | 0.014 | 1.315 | 3 |
+| Steps 151-200 | 0.504 | 21.23 | 0.014 | 1.316 | 1 |
+
+- **Reward**: Stable at ~0.52, no significant trend
+- **Entropy**: Flat at ~1.31 (no collapse)
+- **Grad norm spikes (>50)**: 8/200 (4.0%), comparable to A29B
+- **Step time**: median 114s (18% faster than A29B)
+
+### 11.22 Pipeline Regression Check: PASS
+
+**Test**: Compare in-training eval with post-hoc eval (PEFT merge + vLLM) on the same checkpoint.
+
+**Checkpoint**: A30 step 10 (`/mnt/data/rft_checkpoints/gpt-oss-20b-grpo-a30/global_step10_hf`)
+
+**Results**:
+- In-training eval:  **63.37%** (128/202)
+- Post-hoc eval:     **63.37%** (128/202)
+- Difference:        **0.0 problems** (exact match)
+
+**Verdict**: **PASS**. The LoRA accumulation fix is fully validated. In-training eval curves are trustworthy going forward.
+
+This is a critical milestone: for the first time, in-training eval and post-hoc eval produce identical results. Previously, the accumulation bug caused 2-7pp inflation in in-training numbers (growing with training steps).
+
+**Lesson #20**: After fixing a pipeline bug, always run a quantitative regression check (same checkpoint, both eval paths, identical settings) to confirm the fix works in the actual training pipeline — not just in isolation. The unit test (`test_lora_fix.py`) validated correctness on a single layer; this regression check validates the full end-to-end pipeline.

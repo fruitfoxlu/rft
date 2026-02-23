@@ -1,6 +1,6 @@
 --- a/openrlhf/trainer/ray/vllm_worker_wrap.py
 +++ b/openrlhf/trainer/ray/vllm_worker_wrap.py
-@@ -72,3 +72,98 @@
+@@ -72,3 +72,105 @@
          self.model_runner.model.load_weights(weights=[(name, weight)])
          torch.cuda.synchronize()
 +
@@ -30,10 +30,10 @@
 +
 +        For each LoRA pair (lora_A, lora_B), computes:
 +            delta = scaling * B @ A
-+        and adds it in-place to the corresponding base weight.
++        and reconstructs: param = base_weight_shard + sharded(delta).
 +
-+        Uses load_weights for TP-correct sharding of the delta,
-+        then adds the sharded delta to the saved original weight.
++        The base weights are cached on the first call so that each
++        subsequent call replaces (not accumulates) the LoRA contribution.
 +        """
 +        import re
 +        import torch
@@ -65,6 +65,10 @@
 +                base = name.replace(".lora_B.default", "").replace(".lora_B.", ".")
 +                lora_b[base] = tensor
 +
++        # Lazy-init base weight cache (stores pre-LoRA sharded weights)
++        if not hasattr(self, '_base_weights'):
++            self._base_weights = {}
++
 +        applied = 0
 +        for base_name in lora_a:
 +            if base_name not in lora_b:
@@ -78,15 +82,21 @@
 +            delta = (scaling * (B.float() @ A.float())).to(dtype=torch.bfloat16)
 +
 +            # Use load_weights to correctly shard the delta (handles TP),
-+            # then add the sharded delta back to the saved original weight.
++            # then reconstruct param = base_weight_shard + sharded_delta.
 +            for pname, param in self.model_runner.model.named_parameters():
 +                if pname == clean:
-+                    saved = param.data.clone()
++                    # Cache the original base weight shard on the first call
++                    if clean not in self._base_weights:
++                        self._base_weights[clean] = param.data.clone()
++
 +                    # load_weights replaces param with correctly-sharded delta
 +                    self.model_runner.model.load_weights(weights=[(clean, delta.to("cuda"))])
-+                    # Now param.data contains the sharded delta; add saved original
-+                    param.data.add_(saved)
-+                    del saved
++                    sharded_delta = param.data.clone()
++
++                    # Reconstruct: base_shard + sharded_delta (no accumulation)
++                    param.data.copy_(self._base_weights[clean])
++                    param.data.add_(sharded_delta)
++                    del sharded_delta
 +                    applied += 1
 +                    break
 +            del delta

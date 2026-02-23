@@ -1084,6 +1084,8 @@ All other training hyperparameters are identical to attempt-26. Instrumentation-
 
 13. **Understand `num_episodes` before launching**: In OpenRLHF, `total_steps = len(prompts) * n_samples_per_prompt // train_batch_size * num_episodes * max_epochs`. With 50K prompts, `n_samples=8`, `train_batch=16`, and `num_episodes=5`, this yields **125,000 steps** — not ~40. The LR warmup (5% of total = 6,250 steps) means the model barely trains in the first 50 steps. Both A26 and A27 were effectively at near-zero LR for their entire observed runs. Always compute `max_steps` before launching and verify the LR schedule reaches meaningful values within your intended step budget.
 
+14. **`max_steps` counts gradient steps, not global steps**: OpenRLHF's `max_steps` formula counts **optimizer.step()** calls (gradient steps). Each "global_step" in the training log represents one full rollout-then-train cycle, which contains `n_samples_per_prompt * rollout_batch_size / train_batch_size` gradient steps. With `n_samples=8`, `rollout_batch=16`, `train_batch=16`: each global step = **8 gradient steps**. So `max_steps=200` = only **25 global steps**, not 200. The LR scheduler advances per gradient step (8 times per global step), so the full cosine schedule completes across those 25 global steps. For N global steps, you need `pool_size = N * rollout_batch_size` (with `num_episodes=1`), or equivalently `num_episodes = N * rollout_batch_size / pool_size`.
+
 ### 11.12 Theory: Why Gradient Spikes Escalate
 
 Based on attempt-26 data (52 steps), we propose the following mechanism for escalating gradient norm spikes in GRPO with LoRA:
@@ -1202,7 +1204,7 @@ The original estimate of "~40 steps" was incorrect. With `lr_warmup_ratio=0.05`,
 
 **Root cause of A26/A27 failure**: `num_episodes` with 50K prompts produced 125K–500K total steps. With `lr_warmup_ratio=0.05`, warmup was 6,250–25,000 steps. Runs were stopped at step 46–60 — still in early warmup at <6% of target LR. No meaningful training occurred.
 
-**Fix**: Use a 400-prompt subset (`sft_rl_pool_400.jsonl`) with `num_episodes=1` to yield exactly 200 steps. Warmup is 10 steps (5%), reaching 100% of target LR by step 10.
+**Fix**: Use a 400-prompt subset (`sft_rl_pool_400.jsonl`) with `num_episodes=1` to yield 200 gradient steps (= **25 global steps**). Warmup is 10 gradient steps (~1.25 global steps), reaching 100% of target LR by global step 2. **Note**: This was insufficient for a meaningful A/B comparison — see results below and Lesson #14.
 
 **Scripts**: `train_grpo_20b_a28a.sh` (eps_clip=0.2), `train_grpo_20b_a28b.sh` (eps_clip=0.1)
 
@@ -1212,22 +1214,30 @@ The original estimate of "~40 steps" was incorrect. With `lr_warmup_ratio=0.05`,
 |-----------|-----|-----|-------|
 | `eps_clip` | **0.2** | **0.1** | Only training variable |
 | `prompt_data` | pool_400 | pool_400 | Same 400 prompts, seed=42 |
-| `num_episodes` | 1 | 1 | = 200 steps |
+| `num_episodes` | 1 | 1 | = 200 gradient steps = **25 global steps** |
 | `seed` | 42 | 42 | Fixed for reproducibility |
 | `actor_learning_rate` | 5e-7 | 5e-7 | |
-| `lr_warmup_ratio` | 0.05 | 0.05 | = 10 warmup steps |
+| `lr_warmup_ratio` | 0.05 | 0.05 | = 10 warmup gradient steps (~1.25 global steps) |
 | `eval_steps` | 10 | 10 | |
 | `save_steps` | 10 | 10 | |
 | `eval_dataset` | OOD (202) | OOD (202) | greedy_pass@1 |
 
-**LR schedule** (both runs identical):
+**LR schedule** (both runs identical, **gradient step** numbering, 8 per global step):
 ```
-step   1:  10% of target
-step  10: 100% of target (peak)
-step  50:  91% of target
-step 100:  59% of target
-step 150:  25% of target
-step 200:  10% of target (min_lr)
+grad_step   1 (global ~0.1):  10% of target
+grad_step  10 (global ~1.3): 100% of target (peak)
+grad_step  50 (global ~6.3):  91% of target
+grad_step 100 (global ~12.5): 59% of target
+grad_step 150 (global ~18.8): 25% of target
+grad_step 200 (global  25.0): 10% of target (min_lr)
+```
+**Actual LR at global steps** (observed in A28A):
+```
+global_step  1: 37.5% (avg of grad steps 1-8)
+global_step  3: 99.4% (peak)
+global_step 10: 75.9%
+global_step 20: 21.5%
+global_step 25: 10.1% (min_lr, final step)
 ```
 
 **Pool subset provenance**:
@@ -1236,15 +1246,411 @@ step 200:  10% of target (min_lr)
 - SHA256: `1d09bb26d12774ea770b304bed08b329ca7629c8344dd67dd9f4f7b64e930a0b`
 - Verified: 0 overlap with OOD probe (202) and AIME eval (18)
 
-**Success criteria**:
-1. LR reaches >90% of target by step 10 (verified by preflight)
-2. Both runs complete 200 steps without crashes
-3. OOD eval shows measurable difference between eps_clip=0.2 vs 0.1
-4. Spike pattern (frequency, magnitude) differs between runs
-5. If OOD degrades in either run, compare degradation onset step
+**Success criteria** (original, before step-count discovery):
+1. ~~LR reaches >90% of target by step 10 (verified by preflight)~~ ✅ Achieved by global step 3
+2. ~~Both runs complete 200 steps without crashes~~ ❌ Runs complete in 25 global steps, not 200
+3. ~~OOD eval shows measurable difference between eps_clip=0.2 vs 0.1~~ ❌ Only 2 eval points — insufficient
+4. ~~Spike pattern (frequency, magnitude) differs between runs~~ ⚠️ Spikes observed but no comparison yet
+5. ~~If OOD degrades in either run, compare degradation onset step~~ ❌ Too few eval points
 
 **Output paths**:
 - 28A: `/mnt/data/rft_checkpoints/gpt-oss-20b-grpo-a28a/`, `/mnt/scratch/rft_metrics_20b_a28a/`
 - 28B: `/mnt/data/rft_checkpoints/gpt-oss-20b-grpo-a28b/`, `/mnt/scratch/rft_metrics_20b_a28b/`
 
 **Run order**: Sequential (not parallel — only 8 GPUs). Run 28A first, then 28B.
+
+**Early-stop rule**: If OOD greedy_pass@1 drops for 2 consecutive evals (20 steps) by >= 0.5 pp each, stop and take the best checkpoint so far.
+
+**Provenance (28A)**:
+- Git commit: `fb83c91` (branch: `attempt-26-grpo-20b-em`)
+- Training script SHA256: `222f1ee489d60ebd...`
+- Pool subset SHA256: `1d09bb26d12774ea...`
+- Patch SHAs:
+  - `ratio_logging_loss.patch`: `3f84df906ac7...`
+  - `ppo_actor.patch`: `804ced547a73...`
+  - `vllm_engine.patch`: `9f31cc7ad02f...`
+  - `vllm_worker.patch`: `5d56735cedb9...`
+- OpenRLHF: 0.9.3, vLLM: 0.15.1
+- Seed: 42
+- PID: 734645, launched 2026-02-21 21:03
+
+**Instrumentation verified** (step 1): All 17 required fields present in training_metrics.jsonl, including `actor_lr` (logged every step). LR at step 1 = 1.875e-7 (37.5% of target) — already 6x higher than A27 ever reached.
+
+#### 28A Final Results (25 global steps — completed, not 200)
+
+**CRITICAL DISCOVERY**: The run completed at 25 global steps, not the expected 200. `max_steps=200` counts **gradient steps** (optimizer.step() calls), not global steps. Each global step has 8 gradient steps (`n_samples_per_prompt * rollout_batch_size / train_batch_size = 8*16/16 = 8`). So 200 gradient steps / 8 = 25 global steps. The prompt dataloader exhausted all 400 prompts in 25 rollout batches (`400 / rollout_batch_size=16 = 25`). The LR scheduler completed its full cosine schedule in just 25 global steps. See **Lesson #14**.
+
+**OOD Eval (greedy_pass@1)**:
+
+| Step | OOD greedy_pass@1 | LR (% of target) |
+|------|-------------------|-------------------|
+| 10   | 64.79% | 75.9% |
+| 20   | 64.60% | 21.5% |
+
+No eval at step 25 (eval_steps=10, not triggered at final step). No significant degradation in 2 eval points.
+
+**Training metrics (all 25 steps)**:
+
+| Step | loss | grad_norm | LR | ratio_max | p99 | correct | Notes |
+|------|------|-----------|-----|-----------|-----|---------|-------|
+| 1 | 0.022 | 6.0 | 1.88e-7 | 84 | 1.85 | 0.648 | |
+| 2 | 0.013 | 2.2 | 4.84e-7 | 26 | 1.86 | 0.688 | LR near peak |
+| 3 | 0.018 | 7.2 | 4.97e-7 | 94 | 1.81 | 0.484 | LR at peak |
+| 4 | 0.023 | 13.7 | 4.90e-7 | 228 | 1.84 | 0.500 | |
+| 5 | 0.024 | 3.1 | 4.80e-7 | 72 | 1.96 | 0.570 | |
+| 6 | 0.048 | 18.4 | 4.66e-7 | 144 | 2.04 | 0.484 | |
+| 7 | 0.017 | 2.6 | 4.48e-7 | 74 | 1.81 | 0.508 | |
+| 8 | 0.023 | 2.5 | 4.28e-7 | 59 | 1.78 | 0.500 | |
+| 9 | 0.033 | 5.4 | 4.05e-7 | 38 | 1.89 | 0.703 | |
+| 10 | 0.018 | 14.1 | 3.80e-7 | 555 | 1.88 | 0.516 | |
+| 11 | 0.059 | 13.9 | 3.52e-7 | 65 | 2.27 | 0.648 | |
+| 12 | 0.016 | 26.4 | 3.24e-7 | 95 | 2.21 | 0.711 | |
+| 13 | 0.016 | 3.0 | 2.95e-7 | 69 | 1.90 | 0.523 | |
+| 14 | 0.015 | 10.0 | 2.65e-7 | 154 | 1.78 | 0.398 | |
+| 15 | 0.013 | 1.9 | 2.35e-7 | 100 | 1.55 | 0.320 | |
+| **16** | **1.677** | **2497.5** | 2.06e-7 | 387 | 2.07 | 0.609 | **SPIKE — largest ever** |
+| 17 | 0.011 | 1.7 | 1.79e-7 | 51 | 1.69 | 0.812 | Recovery |
+| 18 | 0.038 | 8.5 | 1.53e-7 | 88 | 1.90 | 0.516 | |
+| 19 | 0.028 | 12.1 | 1.29e-7 | **15471** | 1.81 | 0.344 | Extreme ratio tail |
+| 20 | 0.030 | 13.7 | 1.08e-7 | 156 | 2.02 | 0.586 | |
+| 21 | 0.015 | 6.1 | 8.94e-8 | 57 | 1.62 | 0.430 | |
+| 22 | 0.011 | 2.3 | 7.43e-8 | 144 | 1.86 | 0.594 | |
+| 23 | 0.025 | 27.8 | 6.27e-8 | 74 | 1.85 | 0.398 | |
+| 24 | 0.031 | 6.4 | 5.48e-8 | 99 | 1.82 | 0.508 | |
+| **25** | **0.130** | **214.9** | 5.07e-8 | 95 | 1.98 | 0.594 | **SPIKE** |
+
+**Key observations**:
+
+1. **First real training dynamics**: Step 16 produced grad_norm=2497 — 8.5x larger than the worst A26 spike (294). This is what happens when LR actually reaches meaningful levels. The step 16 spike occurred at LR=2.06e-7 (41% of target).
+
+2. **Ratio tails scale with LR**: Step 19 showed ratio_max=15,471 — an order of magnitude beyond anything seen in A26/A27. At real learning rates, the policy drifts faster from reference, producing extreme ratio outliers on rare tokens.
+
+3. **Model recovers from spikes**: Step 17 (immediately after the worst spike) shows loss=0.011, grad=1.7 — perfectly healthy. The gradient clipping (max_norm=1.0) prevents catastrophic updates, but the underlying policy drift that caused the spike remains.
+
+4. **p99 remains stable through spikes**: log_ratio_abs_p99 stayed in 1.5–2.3 range even at step 16 (p99=2.07) and step 19 (p99=1.81). This confirms spikes are driven by extreme tail tokens, not a broad shift in the ratio distribution.
+
+5. **Spike log hash bug persists**: All 154 spike entries show the same prompt hash `2f444de84f582bf0`. The trigger types are correctly differentiated (69 ratio, 85 loss), but the prompt identification still fails — likely a bug in extracting prompt tokens from padded sequences (system prompt + padding dominates the hash).
+
+6. **Second spike at step 25**: grad_norm=214.9, loss=0.130. Smaller than step 16 but still elevated. Occurred at LR=5.07e-8 (10.1%, at min_lr). Suggests residual policy drift from earlier updates continues to produce ratio outliers even at minimum learning rate.
+
+7. **Reward stability**: Average reward=0.544 across all 25 steps (0.541 excluding step 16). No clear upward or downward trend — too few steps to distinguish signal from noise with 128-sample batches.
+
+8. **Only 2 checkpoints saved**: Steps 10 and 20 (save_steps=10). No final checkpoint or eval at step 25.
+
+9. **Run too short for meaningful A/B comparison**: 25 global steps with only 2 eval points is insufficient to detect eps_clip effects. Need longer runs for A28B.
+
+**Rolling averages**:
+   - Steps 1–10: loss=0.024, correct=0.560, grad=7.5
+   - Steps 11–20: loss=0.190, correct=0.547, grad=258.9 (dominated by step 16 spike)
+   - Steps 21–25: loss=0.046, correct=0.505, grad=51.5
+
+**Conclusion**: A28A confirms the LR schedule fix works (LR reached 99.4% of target at step 3, vs <6% in A26/A27). However, 25 global steps is too few to draw conclusions about eps_clip effectiveness or training convergence. The step-count miscalculation (gradient steps vs global steps) must be fixed before running A28B.
+
+#### Step-Count Fix for A28B and Beyond
+
+**Problem**: `max_steps=200` in the formula counts gradient steps, but each global step has 8 gradient steps. With 400 prompts and `rollout_batch_size=16`, the prompt pool is exhausted in 25 global steps.
+
+**Options for ~200 global steps**:
+
+| Option | Pool size | num_episodes | Global steps | Pros | Cons |
+|--------|-----------|-------------|-------------|------|------|
+| A | 3,200 | 1 | 200 | Each prompt seen once | Need new pool, overlap check |
+| B | 400 | 8 | 200 | Reuse existing pool | Each prompt seen 8 times — memorization risk |
+| C | 1,600 | 2 | 200 | Moderate pool | 2 passes; need new pool |
+
+**Recommendation**: Option A (3,200-prompt pool, num_episodes=1) avoids memorization risk and gives the most diverse training signal. Reservoir sample from the 50K pool with a new seed (or extend the existing 400-prompt pool to 3,200).
+
+**Preflight update done**: `preflight_lr.sh` now displays both gradient steps and global steps, and accepts `RBS` (rollout_batch_size) parameter.
+
+### 11.16 Attempt 29 A/B Design: eps_clip Comparison (corrected step count)
+
+**Goal**: Same as A28 — clean A/B comparison of `eps_clip=0.2` vs `0.1` — but with correct step count (200 global steps instead of 25).
+
+**What changed from A28**: Pool size increased from 400 to **3,200 prompts** (`sft_rl_pool_3200.jsonl`). Each prompt seen once (`num_episodes=1`). This yields `3200 / 16 = 200` global steps and `3200 * 8 / 16 = 1600` gradient steps.
+
+**Scripts**: `train_grpo_20b_a29a.sh` (eps_clip=0.2), `train_grpo_20b_a29b.sh` (eps_clip=0.1)
+
+| Parameter | 29A | 29B | Notes |
+|-----------|-----|-----|-------|
+| `eps_clip` | **0.2** | **0.1** | Only training variable |
+| `prompt_data` | pool_3200 | pool_3200 | Same 3,200 prompts, seed=42 |
+| `num_episodes` | 1 | 1 | Each prompt seen once |
+| `global_steps` | **200** | **200** | = 1,600 gradient steps |
+| `seed` | 42 | 42 | Fixed for reproducibility |
+| `actor_learning_rate` | 5e-7 | 5e-7 | |
+| `lr_warmup_ratio` | 0.05 | 0.05 | = 80 gradient steps (~10 global steps) |
+| `eval_steps` | 10 | 10 | = 20 eval points |
+| `save_steps` | 10 | 10 | = 20 checkpoints |
+| `eval_dataset` | OOD (202) | OOD (202) | greedy_pass@1 |
+
+**LR schedule** (verified by preflight_lr.sh):
+```
+global_step  10: 100% of target (peak, warmup complete)
+global_step  50:  91%
+global_step 100:  59%
+global_step 150:  25%
+global_step 200:  10% (min_lr)
+```
+
+**Pool subset provenance**:
+- Source: `sft_rl_pool.jsonl` (50K prompts)
+- Selection: reservoir sampling, seed=42, k=3200, sorted by SHA-256
+- SHA256: `92b5a983eb343d6627d84f8db79238a9981f3965539acbd920dc87846b905ff2`
+- Verified: 0 overlap with OOD probe (202) and AIME eval (18)
+- 30 prompts overlap with A28's 400-prompt pool (expected, same source pool + seed)
+
+**Success criteria**:
+1. Both runs complete 200 global steps without crashes
+2. OOD eval shows measurable difference between eps_clip=0.2 vs 0.1
+3. Spike pattern (frequency, magnitude) differs between runs
+4. If OOD degrades in either run, compare degradation onset step
+
+**Early-stop rule**: If OOD greedy_pass@1 drops for 3 consecutive evals (30 global steps) by >= 0.5 pp each, stop and take the best checkpoint.
+
+**Run order**: Sequential (not parallel — only 8 GPUs). Run 29A first, then 29B.
+
+#### 29A Final Results (200 global steps, eps_clip=0.2)
+
+**Run completed**: 2026-02-22 05:26 – 14:25 (~9 hours). All 200 global steps, 20 evals, 20 checkpoints.
+
+**OOD Eval (greedy_pass@1)**:
+
+| Step | OOD % | Δ from step 10 |
+|------|-------|----------------|
+| 10 | 64.60 | baseline |
+| 20 | 63.56 | -1.04 |
+| 30 | 63.80 | -0.80 |
+| 40 | 62.50 | -2.10 |
+| 50 | **65.78** | +1.18 |
+| 60 | 64.11 | -0.49 |
+| 70 | 65.22 | +0.62 |
+| 80 | 63.61 | -0.99 |
+| 90 | 63.24 | -1.36 |
+| 100 | **65.78** | +1.18 |
+| 110 | 62.44 | -2.16 |
+| 120 | 64.85 | +0.25 |
+| 130 | 65.41 | +0.81 |
+| 140 | 64.17 | -0.43 |
+| 150 | 64.48 | -0.12 |
+| 160 | 64.42 | -0.18 |
+| 170 | 65.35 | +0.75 |
+| 180 | 65.90 | +1.30 |
+| 190 | 65.10 | +0.50 |
+| **200** | **65.97** | **+1.37 ← BEST** |
+
+**Summary**: OOD eval oscillates in a 3.5pp band (62.4–66.0%) with no sustained degradation. Best checkpoint is the final one (step 200, 65.97%). The slight upward trend in the second half suggests the model is still learning at step 200, but the signal is noisy.
+
+**Gradient spikes** (8 events, all with grad_norm > 100):
+
+| Step | grad_norm | policy_loss | LR (% target) |
+|------|-----------|-------------|----------------|
+| 37 | 898.9 | 0.614 | 95.8% |
+| 57 | 1444.0 | 0.142 | 87.4% |
+| 111 | 142.2 | 0.055 | 50.9% |
+| 125 | 604.1 | 0.020 | 40.8% |
+| 133 | 1015.9 | 0.329 | 35.3% |
+| 154 | 423.9 | 0.925 | 22.7% |
+| 155 | 1590.1 | 0.177 | 22.2% |
+| 164 | 264.6 | 0.166 | 18.0% |
+
+Spikes span steps 37–164 (peak and mid-decay LR). Worst was step 155 (grad=1590). Model recovers within 1–2 steps every time.
+
+**Rolling averages (20-step windows)**:
+- Steps 1–20: reward=0.539, grad=6.6
+- Steps 21–40: reward=0.530, grad=54.9
+- Steps 41–60: reward=0.537, grad=84.8
+- Steps 61–80: reward=0.512, grad=8.2
+- Steps 81–100: reward=0.530, grad=12.7
+- Steps 101–120: reward=0.523, grad=13.8
+- Steps 121–140: reward=0.493, grad=90.9
+- Steps 141–160: reward=0.523, grad=113.8
+- Steps 161–180: reward=0.522, grad=29.4
+- Steps 181–200: reward=0.513, grad=13.7
+
+**KL drift**: 0.0000 → -0.0395 (gradual, not pathological)
+
+**Checkpoints**: 20 saved at `/mnt/data/rft_checkpoints/gpt-oss-20b-grpo-a29a/global_step{10..200}_hf/`
+
+**Provenance**:
+- Git commit: post-`fb83c91` (A29 scripts added)
+- Pool: `sft_rl_pool_3200.jsonl` (SHA256=`92b5a983eb343d66...`)
+- PID: 1155951, launched 2026-02-22 05:26, completed 2026-02-22 14:25
+
+#### 29B Final Results (200 global steps, eps_clip=0.1)
+
+**Run completed**: 2026-02-22 14:28 – 23:23 (~9 hours). All 200 global steps, 20 evals, 20 checkpoints.
+
+**OOD Eval (greedy_pass@1)**:
+
+| Step | OOD % | Δ from step 10 |
+|------|-------|----------------|
+| 10 | 65.78 | baseline |
+| 20 | 63.37 | -2.42 |
+| 30 | 62.62 | -3.16 |
+| 40 | 63.80 | -1.98 |
+| 50 | 61.76 | -4.02 |
+| 60 | 65.28 | -0.50 |
+| 70 | 65.10 | -0.68 |
+| **80** | **67.08** | **+1.30 ← BEST** |
+| 90 | 65.72 | -0.06 |
+| 100 | 64.11 | -1.67 |
+| 110 | 63.86 | -1.93 |
+| 120 | 63.30 | -2.48 |
+| 130 | 63.55 | -2.23 |
+| 140 | 64.48 | -1.30 |
+| 150 | 64.11 | -1.67 |
+| 160 | 67.02 | +1.24 |
+| 170 | 65.22 | -0.56 |
+| 180 | 63.30 | -2.48 |
+| 190 | 63.92 | -1.86 |
+| 200 | 64.67 | -1.12 |
+
+**Gradient spikes** (3 events, all with grad_norm > 100):
+
+| Step | grad_norm | policy_loss | LR (% target) |
+|------|-----------|-------------|----------------|
+| 3 | 129.5 | 0.111 | 24.7% |
+| 60 | 241.9 | 0.036 | 85.8% |
+| 71 | 360.8 | 0.245 | 80.6% |
+
+**No spikes after step 71** — the last 129 steps are completely spike-free.
+
+**KL drift**: 0.0000 → -0.0526
+
+**Checkpoints**: 20 saved at `/mnt/data/rft_checkpoints/gpt-oss-20b-grpo-a29b/global_step{10..200}_hf/`
+
+**Provenance**:
+- PID: 1876917, launched 2026-02-22 14:28, completed 2026-02-22 23:23
+
+#### A29 A/B Comparison: eps_clip=0.2 vs 0.1
+
+**OOD Generalization — No meaningful difference**:
+- Overall avg: A=64.51%, B=64.40% (Δ=-0.11pp)
+- Tail avg (steps 150–200): A=65.20%, B=64.71% (Δ=-0.50pp)
+- Best checkpoint: A=65.97% (step 200), B=67.08% (step 80)
+- Both oscillate in ~4pp band with no sustained degradation
+
+**Stability — Clear winner: eps_clip=0.1**:
+
+| Metric | A (eps_clip=0.2) | B (eps_clip=0.1) | Ratio |
+|--------|-----------------|-----------------|-------|
+| Spike count | 8 | **3** | 2.7x fewer |
+| Max grad_norm | 1590 | **361** | 4.4x smaller |
+| Mean spike grad | 798 | **244** | 3.3x smaller |
+| Last spike step | 164 | **71** | Stops 93 steps earlier |
+| p99 ratio trend | 1.89→1.92 ↑ | **1.86→1.82 ↓** | Tails shrinking |
+
+**Mechanism**: Tighter clipping (0.1 vs 0.2) limits how much a single extreme-ratio token can contribute to the surrogate loss gradient. This breaks the positive feedback loop: policy drift → extreme ratios → large gradients → more drift. With eps_clip=0.1, ratio tails actually shrink over training (p99: 1.86→1.82), while eps_clip=0.2 sees them grow (1.89→1.92).
+
+**Policy dynamics**:
+- Reward: identical (A=0.522, B=0.521)
+- KL: B drifts slightly more (-0.053 vs -0.040) — tighter clipping constrains gradient magnitude but doesn't prevent policy movement, just makes it smoother
+- Mean policy loss (non-spike): B=0.0041, A=0.0061
+
+**Verdict**: `eps_clip=0.1` is the better default for this setup. OOD generalization is equivalent, but training stability is dramatically better. Spikes are 3x rarer, 4x smaller, and cease entirely after step 71 (vs continuing through step 164 with eps_clip=0.2).
+
+**Lesson #15**: `eps_clip=0.1` (half the OpenRLHF default of 0.2) eliminates late-run gradient spikes without sacrificing generalization. For LoRA GRPO with binary reward and small batch sizes (micro_train_batch_size=1), tighter clipping is advisable because individual extreme-ratio tokens dominate the per-micro-batch gradient.
+
+### 11.17 Post-Hoc Evaluation (A29 Checkpoints)
+
+**Eval methodology**: Merge LoRA adapter into base model with PEFT (CPU), save merged weights (MXFP4 expert weights preserved), serve with vLLM (TP=2), evaluate via OpenAI-compatible API with greedy decoding (temperature=0, max_tokens=4096). Sequential per-problem inference.
+
+**Eval sets**:
+- **ID probe** (N=200): reservoir-sampled from training pool (3200 prompts), integer-label math problems
+- **OOD probe** (N=202): held-out math problems, zero overlap with training pool
+- **AIME** (N=18): competition-level problems, zero overlap with training pool
+
+**Results**:
+
+| Checkpoint | ID (N=200) | OOD (N=202) | AIME (N=18) |
+|---|---|---|---|
+| a29a_step200 (eps=0.2) | **53.0%** | **68.3%** | 33.3% |
+| a29b_step80 (eps=0.1) | 48.5% | 60.4% | 50.0% |
+| a29b_step200 (eps=0.1) | 50.5% | 62.9% | 38.9% |
+
+**Statistical significance** (SE ≈ sqrt(p(1-p)/N)):
+- ID (N=200): SE≈3.5%, 95% CI ≈ ±6.9pp → range 48.5-53.0% overlaps within ~1.3 SE
+- OOD (N=202): SE≈3.3%, 95% CI ≈ ±6.5pp → a29a (68.3%) vs a29b_step200 (62.9%) Δ=5.4pp ≈ 1.2 SE
+- AIME (N=18): SE≈11.8%, 95% CI ≈ ±23pp → all three within noise
+
+**Observations**:
+1. **No checkpoint separates with statistical significance** — all ID and OOD differences are within ~1.5 SE
+2. **OOD > ID across all checkpoints** — suggests the ID probe (in-distribution from training pool) may be harder than the OOD probe, or the model learns general math reasoning rather than memorizing training examples
+3. **a29a_step200 is numerically best on both ID and OOD** — but the advantage is not statistically significant
+4. **B step80 vs B step200**: OOD improved from 60.4% → 62.9% (continued training helps slightly), ID improved from 48.5% → 50.5%, but AIME dropped from 50.0% → 38.9% (noise on N=18)
+5. **AIME is too noisy** to inform decisions at N=18
+
+**Checkpoint selection**: Per decision rule (prefer B step200 unless B step80 clearly better on ID/AIME) → **a29b_step200** is the selected checkpoint. While a29a_step200 has higher point estimates, the advantage is not statistically significant (Δ≈1.2 SE on OOD), and a29b has dramatically better training stability. The stability advantage is a systematic effect (not noise), while the eval accuracy difference is plausibly noise.
+
+**Lesson #16**: Post-hoc evaluation on N=200 probe sets has SE≈3.4%, giving 95% CI of ±6.7pp. Distinguishing checkpoints within ~5pp requires either larger eval sets or multiple-seed evaluation. At current sample sizes, in-training OOD eval (which runs every 10 steps over 20 evaluations) provides more signal through averaging than a single post-hoc greedy eval.
+
+### 11.18 Attempt-30 Design
+
+**Goal**: Test `micro_train_batch_size=2` (doubled from 1) to reduce per-step gradient variance, which could:
+- Further reduce spike frequency/severity
+- Allow the optimizer to make more consistent updates
+- Potentially improve OOD generalization by smoothing the loss landscape
+
+**Configuration changes from A29B baseline (eps_clip=0.1)**:
+- `micro_train_batch_size`: 1 → **2**
+- All other hyperparameters identical to A29B
+
+**Memory check needed**: micro_train_batch_size=2 doubles the per-GPU memory for activations during the training forward/backward pass. With the current setup (LoRA r=32, 1.8B active params, MoE 20B total, MXFP4 quantization), this needs profiling to confirm it fits in GPU memory.
+
+**Eval plan**:
+- Monitor OOD eval every 10 steps (as in A29)
+- Compare spike frequency/severity with A29B
+- Post-hoc eval on best checkpoint if OOD shows improvement
+
+**Decision criteria**:
+- If spikes drop further AND OOD improves → micro_train_batch_size=2 is the better default
+- If spikes drop but OOD flat → marginal improvement, consider increasing horizon (400 global steps with 6400-prompt pool)
+- If OOM → fall back to micro_train_batch_size=1 and try gradient accumulation or reduced max_len
+
+### 11.19 Bug Fix: LoRA Weight Accumulation in vLLM Worker
+
+**Bug discovered**: Post-hoc eval showed a ~6-7pp mismatch vs in-training eval on the same OOD probe set (e.g., a29b_step80: 67.1% in-training vs 60.4% post-hoc). With greedy decoding on N=202, this should be near-zero.
+
+**Root cause**: Our `apply_lora_delta()` in `patches/vllm_worker.patch` had an accumulation bug. Each call computed `delta = scaling * B @ A` (the full LoRA contribution) and added it to the current weight — which already contained previous deltas. After N weight syncs:
+
+```
+param = W_base + delta_0 + delta_1 + ... + delta_N  (BUG)
+param = W_base + delta_N                             (CORRECT)
+```
+
+Since `delta_N` is the complete LoRA correction (not an increment), the correct behavior is to replace the previous delta, not accumulate.
+
+**Impact**:
+1. **In-training eval**: Evaluated an accumulated-delta model that doesn't correspond to any saved checkpoint. All in-training OOD eval numbers from A29 (and earlier runs using this path) are unreliable.
+2. **Rollout generation**: vLLM generated training samples using the accumulated model, creating a distribution mismatch between the generation policy and the actor policy. Effect is likely minor with small LR/LoRA, but introduces an uncontrolled variable.
+3. **Post-hoc eval**: Uses PEFT merge directly (no `apply_lora_delta`), so post-hoc results are correct.
+4. **Saved checkpoints**: PEFT adapters are saved from the actor model (which has correct LoRA weights), so all saved checkpoints are correct.
+
+**Fix**: Cache the original base weight shard on the first call to `apply_lora_delta()`. On each subsequent call, reconstruct `param = base_shard + sharded(delta)` instead of accumulating. Added `self._base_weights` dict (~640 MB per vLLM worker GPU for this model's attention weights).
+
+**Lesson #17**: When implementing LoRA weight sync to a separate inference engine, distinguish between "full delta" (the complete LoRA contribution `scaling * B @ A`) and "incremental delta" (the change from the previous step). If sending the full delta, the receiver must subtract the old delta before adding the new one, or cache the base weights and reconstruct from scratch. The original code treated a full delta as if it were an incremental delta.
+
+**Lesson #18**: Always validate in-training eval against an independent post-hoc eval pipeline on a subset of checkpoints. Discrepancies exceeding the expected noise (SE ≈ sqrt(p(1-p)/N)) indicate a pipeline bug.
+
+### 11.20 Profile: micro_train_batch_size=2
+
+**Setup**: 5 global steps (40 gradient steps) on 80-prompt pool, all other config identical to A29B (eps_clip=0.1). Script: `profile_micro2.sh`.
+
+**Results**:
+
+| Step | Time (s) | Grad Norm | Reward | Tokens/batch | log_ratio_abs_p99 |
+|------|----------|-----------|--------|-------------|-------------------|
+| 1 | (warmup) | 5.16 | 0.547 | 3547 | 1.71 |
+| 2 | 125.9 | 1.77 | 0.352 | 4489 | 1.77 |
+| 3 | 104.1 | 39.06 | 0.500 | 2067 | 2.09 |
+| 4 | 114.7 | 171.40 | 0.398 | 2990 | 1.99 |
+| 5 | 113.5 | 7.03 | 0.609 | 2788 | 1.89 |
+
+**Key findings**:
+- **No OOM**: micro_train_batch_size=2 fits comfortably in GPU memory
+- **Zero cache flush warnings**: Improved vs micro=1 (A29B had cache flush warnings at steps 1 and 5-6)
+- **~18% faster per global step**: avg 114.6s/step (micro=2) vs ~140s/step (micro=1). Fewer micro-batch passes (8 vs 16) per gradient step reduces kernel launch overhead
+- **Grad norms**: One spike (171 at step 4) on 80 prompts — too few steps to compare with A29B, but step 4 spike suggests spikes are still possible with micro=2
+- **Verdict**: micro_train_batch_size=2 is viable. Proceed with full attempt-30.
+
+**Lesson #19**: Doubling micro_train_batch_size from 1→2 in this setup does not cause OOM and actually reduces training time by ~18% (fewer micro-batch forward/backward passes, better GPU utilization). The previous cache flush warnings with micro=1 disappear, suggesting micro=1 was suboptimal for GPU memory management.

@@ -70,7 +70,7 @@ fi
 
 # --- Pre-flight LR check ---
 echo "=== Pre-flight LR schedule check ==="
-POOL=$(wc -l < "$TRAIN_DATA") NS=8 TBS=16 EP=1 WARMUP=0.05 LR=5e-7 \
+POOL=$(wc -l < "$TRAIN_DATA") NS=8 TBS=16 RBS=16 EP=1 WARMUP=0.05 LR=5e-7 \
     bash "${SCRIPT_DIR}/preflight_lr.sh" || { echo "ABORT: LR schedule check failed."; exit 1; }
 echo ""
 

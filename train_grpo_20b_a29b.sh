@@ -1,32 +1,41 @@
 #!/usr/bin/env bash
-# GRPO training for gpt-oss-20b — Attempt 28A (eps_clip=0.2 baseline)
+# GRPO training for gpt-oss-20b — Attempt 29B (eps_clip=0.1 tighter clipping)
 #
-# A/B EXPERIMENT: eps_clip comparison with correct LR schedule.
-#   28A: eps_clip=0.2 (OpenRLHF default)
-#   28B: eps_clip=0.1 (tighter clipping)
+# A/B EXPERIMENT: eps_clip comparison with correct step count.
+#   29A: eps_clip=0.2 (OpenRLHF default)
+#   29B: eps_clip=0.1 (tighter clipping)
 #
-# CHANGES FROM A26/A27:
-#   - pool: 50K → 400 prompts (sft_rl_pool_400.jsonl, seed=42)
-#   - num_episodes: 5 → 1 (yields 200 steps with 400 prompts)
-#   - LR warmup reaches 100% by step 10 (vs never reaching meaningful LR in A26/A27)
-#   - Seed fixed (--seed 42) for reproducibility
-#   - Updated spike logging (trigger on per-micro-batch ratio/loss, not stale grad_norm)
+# CHANGES FROM A28:
+#   - pool: 400 → 3200 prompts (sft_rl_pool_3200.jsonl, seed=42)
+#   - This yields 200 GLOBAL steps (1600 gradient steps)
+#   - A28 had only 25 global steps (200 gradient steps) — too short
+#
+# Step count (verified by preflight_lr.sh):
+#   gradient_steps = pool * n_samples / train_batch * episodes = 3200 * 8 / 16 * 1 = 1600
+#   grad_per_global = n_samples * rollout_batch / train_batch = 8 * 16 / 16 = 8
+#   global_steps = 1600 / 8 = 200
 #
 # LR schedule (verified by preflight_lr.sh):
-#   step 1:  10%, step 10: 100% (peak), step 50: 91%, step 100: 59%, step 200: 10% (min_lr)
+#   warmup: 80 gradient steps (~10 global steps)
+#   global step  10: 100% of target (peak)
+#   global step  50:  91%
+#   global step 100:  59%
+#   global step 150:  25%
+#   global step 200:  10% (min_lr)
 #
 # Pool subset provenance:
-#   sft_rl_pool_400.jsonl: 400 prompts, seed=42, SHA256=1d09bb26d12774ea...
+#   sft_rl_pool_3200.jsonl: 3200 prompts, seed=42, SHA256=92b5a983eb343d66...
 #   No overlap with OOD probe (202 problems) or AIME eval (18 problems)
 #
 # Config:
 #   ┌──────────────────────────┬───────────┬───────────┐
-#   │ Parameter                │ 28A       │ 28B       │
+#   │ Parameter                │ 29A       │ 29B       │
 #   ├──────────────────────────┼───────────┼───────────┤
 #   │ eps_clip                 │ 0.2 ★     │ 0.1 ★     │
 #   ├──────────────────────────┼───────────┼───────────┤
-#   │ prompt_data              │ pool_400  │ pool_400  │
+#   │ prompt_data              │ pool_3200 │ pool_3200 │
 #   │ num_episodes             │ 1         │ 1         │
+#   │ global_steps             │ 200       │ 200       │
 #   │ seed                     │ 42        │ 42        │
 #   │ actor_learning_rate      │ 5e-7      │ 5e-7      │
 #   │ micro_train_batch_size   │ 1         │ 1         │
@@ -50,14 +59,14 @@ export NCCL_DEBUG=INFO
 export NCCL_CUMEM_ENABLE=0
 
 # --- Attempt-specific paths ---
-ATTEMPT="a28a"
+ATTEMPT="a29b"
 export METRICS_LOG_DIR="/mnt/scratch/rft_metrics_20b_${ATTEMPT}"
 export SAMPLES_LOG_DIR="/mnt/scratch/rft_samples_20b_${ATTEMPT}"
 export SPIKE_LOG_PATH="/mnt/scratch/rft_metrics_20b_${ATTEMPT}/spike_log.jsonl"
 mkdir -p "$METRICS_LOG_DIR" "$SAMPLES_LOG_DIR"
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-TRAIN_DATA="${SCRIPT_DIR}/data/sft_rl_pool_400.jsonl"
+TRAIN_DATA="${SCRIPT_DIR}/data/sft_rl_pool_3200.jsonl"
 EVAL_DATA="${SCRIPT_DIR}/data/probe_set_200_ood.jsonl"
 REWARD_FUNC="${SCRIPT_DIR}/reward_func_em.py"
 SAVE_PATH="/mnt/data/rft_output/gpt-oss-20b-grpo-${ATTEMPT}"
@@ -74,7 +83,7 @@ POOL=$(wc -l < "$TRAIN_DATA") NS=8 TBS=16 RBS=16 EP=1 WARMUP=0.05 LR=5e-7 \
     bash "${SCRIPT_DIR}/preflight_lr.sh" || { echo "ABORT: LR schedule check failed."; exit 1; }
 echo ""
 
-echo "=== GRPO Training — Attempt 28A (gpt-oss-20b, eps_clip=0.2) ==="
+echo "=== GRPO Training — Attempt 29B (gpt-oss-20b, eps_clip=0.1) ==="
 echo "  Model:       openai/gpt-oss-20b"
 echo "  Train data:  $TRAIN_DATA ($(wc -l < "$TRAIN_DATA") prompts)"
 echo "  Eval data:   $EVAL_DATA (OOD probe: 170 MATH + 32 Apex)"
@@ -82,9 +91,9 @@ echo "  Reward:      Pure exact-match"
 echo "  Save path:   $SAVE_PATH"
 echo "  Checkpoints: $CKPT_PATH"
 echo ""
-echo "  ★ eps_clip=0.2 (baseline)"
-echo "  ★ 200 steps, LR peaks at step 10"
-echo "  ★ Eval: greedy_pass@1 on OOD probe every 10 steps"
+echo "  ★ eps_clip=0.1 (tighter clipping)"
+echo "  ★ 200 global steps (1600 gradient steps), LR peaks at global step ~10"
+echo "  ★ Eval: greedy_pass@1 on OOD probe every 10 global steps"
 echo ""
 
 python -m openrlhf.cli.train_ppo_ray \
@@ -107,7 +116,7 @@ python -m openrlhf.cli.train_ppo_ray \
     --max_len 5120 \
     --prompt_max_len 1024 \
     --generate_max_len 4096 \
-    --eps_clip 0.2 \
+    --eps_clip 0.1 \
     --lora_rank 32 \
     --lora_alpha 64 \
     --target_modules q_proj k_proj v_proj o_proj \

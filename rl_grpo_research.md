@@ -1762,3 +1762,138 @@ All pairwise differences are within sampling noise. No statistically significant
 - The differences are within statistical noise at N=200, reinforcing the need for OOD-1000 (N=1000, SE≈1.5%) to detect meaningful effects in future experiments.
 
 **Lesson #21**: When comparing hyperparameter changes, post-hoc eval on multiple checkpoints (best + final) with identical settings is essential. In-training eval curves are noisy (±3pp step-to-step), and comparing single checkpoints at the same step number can be misleading. Compare best-vs-best and final-vs-final to separate the hyperparameter effect from checkpoint selection noise.
+
+### 11.24 Experiment SOP v2: STOP vs DEBUG Decision Framework
+
+**Purpose**: Prevent self-deception and wasted compute by defining mechanical criteria for when to declare success (STOP-1) vs when to switch to structured debugging (STOP-3).
+
+#### Constants (fixed across all comparisons)
+
+- **Primary metric**: OOD-1000 greedy_pass@1 (temp=0, n=1)
+  - Dataset: `data/probe_set_1000_ood.jsonl` (SHA256: `5700782fa9a6b5f0...`)
+  - Parsing: `reward_func_em.py` (boxed → last_number fallback → integer normalization)
+  - SE ≈ 1.5% at p≈0.65, 95% CI ≈ ±3.0pp
+- **Secondary**: ID-200 greedy_pass@1 (stability/regression check)
+- **Sanity only**: AIME-18 (SE≈11%, do NOT use for decisions)
+- **Provenance**: Every run records git SHA, patch SHAs, dataset SHA256, pool SHA256, seeds, exact eval commands
+
+#### STOP-1: Performance Win (staged, compute-aware)
+
+**Gate-1** (after Run-1):
+- Paired Δ on OOD-1000 ≥ +3pp vs current baseline checkpoint
+- McNemar exact p < 0.05 (or bootstrap 95% CI lower bound > 0)
+- Keep paired per-problem records (qid/hash, correct_baseline, correct_new, model_output) for post-hoc analysis
+- If Gate-1 passes → launch confirmation run
+
+**Gate-2** (after confirmation run):
+- Rerun with different seed (same pool, same config) — tests training stochasticity
+- Both deltas > 0 and mean Δ ≥ +3pp → declare **STOP-1**
+- If mean Δ ≥ +4pp → declare **STOP-1 (gold win)**
+- Optional robustness: different pool subsample (tests data sensitivity) — not required for STOP-1
+
+**No-regression check**: ID-200 must not worsen by > 3pp in either run.
+
+#### Checkpoint Selection (bias control)
+
+Evaluate exactly **K=3 fixed checkpoints** per run on OOD-1000:
+1. **Final** (last step)
+2. **Mid** (halfway through training)
+3. **Best-by-inrun-OOD202** (best smoothed in-training OOD-202 score, 3-point moving average)
+
+Always report all K results. No "evaluate 20 checkpoints and pick the best" without multiple-testing correction.
+
+#### Early Stopping Within a Run
+
+Use smoothed OOD-202 (3-point moving average over eval steps) with patience:
+- If smoothed OOD-202 has not exceeded (best + 0.5pp) for 50 consecutive global steps → consider stopping early
+- Still evaluate the K=3 fixed checkpoints on OOD-1000 for the final run summary
+- This saves compute by avoiding the cosine LR over-decay problem observed in A30 (peak at step 130/200)
+
+#### Pre-Fault-Tree: Parser/Eval Ceiling Check
+
+After each run, before entering the fault tree:
+1. Sample 50 "incorrect" OOD-1000 cases from the best checkpoint
+2. Manually verify parsing: did `extract_model_answer()` extract the right answer?
+3. If mis-parse rate > 5% → fix parser/format first, re-evaluate, before attributing lack of gains to the model
+4. Track parse_method distribution (boxed vs last_number vs none) per run
+
+#### STOP-3: Diminishing Returns Trigger
+
+**Trigger**: 2 consecutive clean single-variable runs with:
+- OOD-1000 Δ < +1pp AND bootstrap 95% CI includes 0
+
+Use a 3rd run only if results are in the gray zone (+1pp to +3pp, ambiguous CI).
+
+When STOP-3 triggers → enter Debug Workflow (fault tree below).
+
+#### Debug Workflow: Fault Tree
+
+When STOP-3 triggers, classify the bottleneck and choose the next single-variable intervention.
+
+**A) Reward Sparsity / Credit Assignment**
+
+*Symptoms*: Average reward flat; pass@1 doesn't move; "fragile" behavior.
+
+*Diagnostics*:
+- For a fixed sample of training prompts, measure pass@1 vs pass@8-any-correct
+- If pass@8 >> pass@1 → reliability problem, sparse positive signal
+
+*Interventions* (choose one):
+- Increase n_samples_per_prompt (8 → 16) to increase positive-sample density
+- Add lightweight shaping bonuses (e.g., +0.05 for boxed_in_final) while keeping incorrect=0
+- Last resort: judge-based quality shaping (higher complexity/cost)
+
+**B) LoRA Capacity**
+
+*Symptoms*: OOD and ID flat despite stable training dynamics (spikes controlled, ratio tails stable).
+
+*Diagnostics*:
+- Compare rank=32 across multiple runs; check if learning signals plateau early
+- Check if LoRA weight norms are saturating
+
+*Interventions*:
+- Increase LoRA rank (32 → 64, with alpha=128 to maintain ratio)
+- Later: expand target modules beyond attention-only
+
+**C) Data Distribution / Difficulty Mismatch**
+
+*Symptoms*: Training correctness improves but OOD-1000 does not (or worsens).
+
+*Diagnostics*:
+- Bucket OOD-1000 by source/topic and report per-bucket accuracy
+- Compare to training pool distribution (coverage gap)
+
+*Interventions*:
+- Adjust training pool toward OOD distribution (more hard/targeted categories)
+- Implement curriculum or difficulty-based sampling
+
+**D) RL Dynamics / Schedule**
+
+*Symptoms*: Ratio tails shrink to near-1 quickly; learning stalls in later steps.
+
+*Diagnostics*:
+- Track LR over global steps; confirm effective LR window overlaps training horizon
+- Track ratio_p99 trend, KL trend, update magnitudes
+- Check if peak performance step correlates with LR level
+
+*Interventions*:
+- Increase min_lr (0.1×target → 0.2×target) — directly addresses A30 observation
+- Adjust KL coefficient (init_kl_coef) — separate A/B
+
+#### Deliverables After Each Run
+
+One-page summary containing:
+1. Config diff (single variable changed)
+2. Best checkpoint selection (K=3 results on OOD-1000)
+3. OOD-1000 and ID-200 results with Δ vs baseline and 95% CI
+4. Stability stats (spike count, ratio tail trend)
+5. Parser ceiling check (50-case manual review)
+6. Decision: **STOP-1 achieved** / **Continue** (next planned run) / **STOP-3 triggered** (enter debug, selected bottleneck class)
+
+#### Operational Rules
+
+1. **One variable per run.** If you change pool size, do not change LR/KL/rank.
+2. **Same eval pipeline.** OOD-1000 post-hoc eval selects checkpoints; OOD-202 is in-run monitoring only.
+3. **Full provenance.** Git SHA, all dataset SHA256s, seeds, exact commands — in the run summary.
+4. **No data leakage.** Verify disjoint-by-hash (pool vs OOD-1000, pool vs ID-200) before every run.
+5. **Save model outputs.** Full generation text for all OOD-1000 problems (not just correct/incorrect) for post-hoc analysis.

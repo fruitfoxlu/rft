@@ -1943,3 +1943,42 @@ When STOP-3 triggers, classify the bottleneck and choose the next single-variabl
 4. **No data leakage.** Verify disjoint-by-hash (pool vs OOD-1000, pool vs ID-200) before every run.
 5. **Save model outputs.** Full generation text for all OOD-1000 problems (not just correct/incorrect) for post-hoc analysis.
 6. **Pipeline preflight.** After any eval/pipeline change, run regression check before full attempt.
+
+### 11.25 OOD-1000 Baseline Eval (Establishing Baseline-SOTA)
+
+**Purpose**: Evaluate existing checkpoints on OOD-1000 to establish Baseline-SOTA per SOP v2.1-final §0.
+
+**Checkpoints evaluated** (all already merged at `/mnt/scratch/merged_models/`):
+- `a29b_step200`: A29B final (micro=1, LoRA bug during training, merge is correct)
+- `a30_step130`: A30 best-by-inrun-OOD202 (micro=2, fixed pipeline)
+- `a30_step200`: A30 final (micro=2, fixed pipeline)
+
+**Eval settings**: greedy (temp=0, n=1), max_tokens=4096, vLLM TP=2, same parsing as `reward_func_em.py`.
+
+**Results**:
+
+| Model | OOD-1000 | ID-200 | AIME-18 |
+|-------|----------|--------|---------|
+| a29b_step200 | 73.70% (737/1000) | 51.00% (102/200) | 38.89% (7/18) |
+| a30_step130 | 73.50% (735/1000) | 52.50% (105/200) | 38.89% (7/18) |
+| a30_step200 | 73.60% (736/1000) | 50.00% (100/200) | 44.44% (8/18) |
+
+**Analysis**:
+- **All three checkpoints are statistically indistinguishable on OOD-1000.** Max pairwise Δ = 0.2pp (2 problems). SE ≈ 1.5%, so the 95% CI (±3.0pp) is much larger than any observed difference.
+- The earlier OOD-202 result (a30_step130 = 65.35% vs a29b_step200 = 62.87%, Δ = +2.5pp) was **noise** — confirmed by OOD-1000 showing Δ = -0.2pp. This validates the decision to build OOD-1000: the smaller probe was giving misleading signals.
+- ID-200 is similarly flat (range 50.0%–52.5%, within SE).
+- AIME-18 shows a30_step200 at 44.4% vs 38.9%, but this is 1 problem difference (N=18, SE=11%) — pure noise.
+
+**Baseline-SOTA pin**: **a30_step130** at 73.50% OOD-1000, 52.50% ID-200.
+- Rationale: from the fixed pipeline (no LoRA accumulation bug), micro=2 default, and the best-by-monitor checkpoint
+- All future runs compare against this baseline
+
+**Baseline-S0**: Not yet evaluated (base model with no LoRA). Will be evaluated before A31 per SOP §0.
+
+**Provenance**:
+- OOD-1000: `data/probe_set_1000_ood.jsonl` SHA256: `5700782fa9a6b5f0e01ce60f0e239d25ec0e8a49954f656d4cb9bd37c42f264b`
+- ID-200: `data/probe_set_200.jsonl` SHA256: `cee48574208d948163401a9421bb01963726ca0680d810dd2acf69e819b16384`
+- AIME-18: `data/aime_eval.jsonl` SHA256: `856a54bf509acf5824893ac0929facf51408cc7cd40b88c12e9d620e1cfd55b0`
+- Full results: `/mnt/scratch/posthoc_eval_ood1000_baseline.json`
+
+**Lesson #22**: OOD-202 was giving misleading checkpoint-selection signals (+2.5pp difference that turned out to be noise on OOD-1000). At SE≈3.4%, differences up to ~7pp can appear by chance. OOD-1000 (SE≈1.5%) resolves this — differences >3pp are likely real, and the flat results here (Δ<0.2pp) give high confidence that all three checkpoints are truly equivalent. Always use the largest available probe for decisions; use the smaller probe for in-training monitoring only.

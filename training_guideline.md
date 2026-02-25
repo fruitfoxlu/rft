@@ -149,9 +149,9 @@ diff -u original_file modified_file > patches/my_fix.patch
 
 | Mount Point | Size | Purpose | Examples |
 |-------------|------|---------|----------|
-| `/mnt/data` | 6 TB NVMe | Model checkpoints, training outputs, large persistent data | `/mnt/data/rft_output/`, `/mnt/data/rft_checkpoints/` |
-| `/mnt/scratch` | 1 TB NVMe | Logs, metrics, temporary files, sample outputs | `/mnt/scratch/rft_metrics_20b/`, `/mnt/scratch/train_20b.log` |
-| `/home/rlu/Code/rft` | Boot disk | Code, configs, small data files | Scripts, patches, `data/*.jsonl` |
+| `/mnt/data` | 1 TB NVMe | Model checkpoints, training outputs, large persistent data | `/mnt/data/rft_output/`, `/mnt/data/rft_checkpoints/` |
+| `/mnt/scratch` | 5.9 TB RAID-0 (16×375G NVMe) | HF cache, merged models, metrics, logs, temporary files | `/mnt/scratch/hf/`, `/mnt/scratch/merged_models/`, `/mnt/scratch/rft_metrics_20b/` |
+| `/home/rlu/Code/rft` | Boot disk (1TB) | Code, configs, small data files | Scripts, patches, `data/*.jsonl` |
 
 ### Critical Rules
 
@@ -720,6 +720,118 @@ Signs to watch for:
 **Attempt-26 example**: Training correctness improved (rolling avg 0.51 → 0.56) while AIME pass@1 degraded (35.4% peak at step 20 → 27.1% at step 50, below pre-training baseline). An ID-only probe set would have missed this divergence — the OOD probe is essential.
 
 Response: Use separate ID and OOD probe sets. If OOD probe drops for 2 consecutive evals, stop training. The best checkpoint is usually earlier than you think (attempt-26 peaked at step 30 out of 60+).
+
+---
+
+## 13. Spare Machine (h100-8-5) — Eval & Diagnostics
+
+### Overview
+
+h100-8-5 is a drop-in spare for running eval/diagnostics in parallel with training on the primary (h100-8-4). It mirrors the primary's environment exactly.
+
+| Item | Primary (h100-8-4) | Spare (h100-8-5) |
+|------|---------------------|-------------------|
+| Internal IP | `10.202.0.2` | `10.202.0.3` |
+| Repo | `~/Code/rft` | `~/Code/rft` |
+| Conda env | `rft` | `rft` |
+| `/mnt/data` | 1TB NVMe | 1TB NVMe |
+| `/mnt/scratch` | 5.9TB RAID-0 (16×375G) | 5.9TB RAID-0 (16×375G) |
+| GPUs | 8× H100 80GB | 8× H100 80GB |
+
+### SSH Access (from primary)
+
+```bash
+ssh -i ~/.ssh/google_compute_engine rlu@10.202.0.3
+```
+
+### Model Sync Strategy: Cache-First (Approach A)
+
+Base models are downloaded once from HF and cached on `/mnt/scratch/hf/`. RL checkpoints are LoRA adapters (~50-200MB) — copy only adapters via `rsync`, then merge locally on spare. Merged outputs are cached under `/mnt/scratch/merged_models/`.
+
+| Artifact | Size | How Synced | Location on Spare |
+|----------|------|------------|-------------------|
+| HF base models | 10-60GB | Auto-download (HF cache) | `/mnt/scratch/hf/` |
+| LoRA adapters | 50-200MB | `rsync` from primary | `/mnt/data/rft_checkpoints/` |
+| Merged models | 20-40GB | Built locally (`eval_posthoc.py`) | `/mnt/scratch/merged_models/` |
+| Code + datasets | <25MB | `git bundle` (repo is not pushed) | `~/Code/rft/` |
+
+**Sync commands:**
+
+```bash
+# Sync code (git bundle for unpushed commits)
+cd ~/Code/rft
+git bundle create /tmp/rft-sync.bundle origin/attempt-26-grpo-20b-em..HEAD
+scp -i ~/.ssh/google_compute_engine /tmp/rft-sync.bundle rlu@10.202.0.3:/tmp/rft-sync.bundle
+ssh -i ~/.ssh/google_compute_engine rlu@10.202.0.3 'cd ~/Code/rft && git fetch /tmp/rft-sync.bundle HEAD:refs/heads/bundle-tmp && git merge bundle-tmp --ff-only && git branch -d bundle-tmp'
+
+# Sync data (gitignored files)
+rsync -avz -e "ssh -i ~/.ssh/google_compute_engine" ~/Code/rft/data/ rlu@10.202.0.3:~/Code/rft/data/
+
+# Sync a LoRA adapter
+rsync -avz -e "ssh -i ~/.ssh/google_compute_engine" \
+  /mnt/data/rft_checkpoints/gpt-oss-20b-grpo-a30/global_step130_hf/ \
+  rlu@10.202.0.3:/mnt/data/rft_checkpoints/gpt-oss-20b-grpo-a30/global_step130_hf/
+```
+
+**Verification:**
+
+```bash
+# Compare SHA, datasets, packages
+LOCAL_SHA=$(git rev-parse HEAD)
+SPARE_SHA=$(ssh -i ~/.ssh/google_compute_engine rlu@10.202.0.3 'cd ~/Code/rft && git rev-parse HEAD')
+[ "$LOCAL_SHA" = "$SPARE_SHA" ] && echo "OK" || echo "MISMATCH"
+```
+
+### Task Dispatch
+
+**Standard pattern** (tmux session on spare, logs to `/mnt/scratch/eval_spare/logs/`):
+
+```bash
+SSH="ssh -i ~/.ssh/google_compute_engine rlu@10.202.0.3"
+
+# Example 1: Model sweep (OOD-1000, all 4 models)
+$SSH 'tmux new-session -d -s eval-sweep "cd ~/Code/rft && conda activate rft && python eval_model_sweep.py --stage 1 2>&1 | tee /mnt/scratch/eval_spare/logs/sweep_stage1.log"'
+
+# Example 2: Paired OOD-1000 (base vs RL)
+$SSH 'tmux new-session -d -s eval-ood1000 "cd ~/Code/rft && conda activate rft && python eval_baseline_s0.py 2>&1 | tee /mnt/scratch/eval_spare/logs/paired_ood1000.log"'
+
+# Example 3: Post-hoc eval with merged checkpoint
+$SSH 'tmux new-session -d -s eval-posthoc "cd ~/Code/rft && conda activate rft && python eval_posthoc.py --model a30_step130=/mnt/scratch/merged_models/a30_step130 2>&1 | tee /mnt/scratch/eval_spare/logs/posthoc.log"'
+```
+
+**Monitoring:**
+
+```bash
+$SSH 'tmux list-sessions'                                           # list jobs
+$SSH -t 'tmux attach -t eval-sweep'                                 # attach (Ctrl-B D to detach)
+$SSH 'tail -30 /mnt/scratch/eval_spare/logs/sweep_stage1.log'       # tail log
+$SSH 'nvidia-smi --query-gpu=index,utilization.gpu,memory.used --format=csv'  # GPU status
+```
+
+### Environment Variables (on spare)
+
+Set in `~/.bashrc` and `~/.profile`:
+
+```bash
+export HF_HOME=/mnt/scratch/hf
+export TRANSFORMERS_CACHE=/mnt/scratch/hf/transformers
+export HF_DATASETS_CACHE=/mnt/scratch/hf/datasets
+export VLLM_CACHE_DIR=/mnt/scratch/vllm_cache
+```
+
+### Patch Sync
+
+All 11 OpenRLHF patches are applied by copying the already-patched files from the primary's site-packages. If you reinstall openrlhf on the spare, re-sync patches:
+
+```bash
+# On primary: create tarball of patched files
+SITE_PKG=$(conda run -n rft python -c 'import openrlhf; import os; print(os.path.dirname(os.path.dirname(openrlhf.__file__)))')
+cd $SITE_PKG && tar czf /tmp/patched_openrlhf.tar.gz openrlhf/models/actor.py openrlhf/models/loss.py openrlhf/trainer/ray/ppo_actor.py openrlhf/trainer/ray/vllm_engine.py openrlhf/trainer/ray/vllm_worker_wrap.py openrlhf/trainer/ppo_utils/experience_maker.py openrlhf/trainer/ppo_trainer.py openrlhf/cli/train_ppo_ray.py openrlhf/utils/deepspeed/deepspeed.py
+
+# Copy and extract on spare
+scp -i ~/.ssh/google_compute_engine /tmp/patched_openrlhf.tar.gz rlu@10.202.0.3:/tmp/
+ssh -i ~/.ssh/google_compute_engine rlu@10.202.0.3 "SITE_PKG=\$(conda run -n rft python -c 'import openrlhf; import os; print(os.path.dirname(os.path.dirname(openrlhf.__file__)))') && cd \$SITE_PKG && tar xzf /tmp/patched_openrlhf.tar.gz"
+```
 
 ---
 

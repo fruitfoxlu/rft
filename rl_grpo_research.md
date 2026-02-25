@@ -2067,3 +2067,98 @@ The most concerning signal is that the discordant count (b+c=118, or 12.2% of pr
 - Full results: `/mnt/scratch/baseline_s0_eval/baseline_comparison.json`
 - Per-problem results: `/mnt/scratch/baseline_s0_eval/s0_ood1000.jsonl`, `sota_ood1000.jsonl`
 - Paired records: `/mnt/scratch/baseline_s0_eval/paired_records_s0_sota_ood1000.jsonl`
+
+### 11.27 Strategic Pivot: Base Model Sweep for RL Headroom
+
+**Motivation**: §11.26 established that RL training on gpt-oss-20b produces zero measurable improvement. The most likely explanation is **insufficient headroom**: the base model already scores 73.8% on OOD-1000 (greedy@1), leaving only ~26% of problems where RL could potentially improve performance. With binary EM reward, most rollouts either all succeed (reward=1, no gradient signal) or all fail (the model genuinely cannot solve the problem, so reward=0 with no useful contrast). The effective "learning zone" — problems the model sometimes gets right and sometimes wrong — may be too narrow for GRPO to exploit.
+
+**Hypothesis**: A model with lower baseline accuracy (target: ~60–70% OOD-1000) would have more problems in the learning zone, providing richer reward signal for RL. If RL still shows zero improvement on such a model, the issue is elsewhere (reward function, RL algorithm, LoRA capacity). If RL works, we confirm that headroom was the bottleneck with gpt-oss-20b.
+
+**gpt-oss-20b reference baseline** (from §11.25–11.26, no prompt suffix):
+
+| Eval Set | Accuracy | Parse: boxed% | last_number% | fail% |
+|----------|----------|---------------|-------------|-------|
+| OOD-1000 | 73.80% (738/1000) | ~71% | ~12% | ~17% |
+| ID-200 | 51.50% (103/200) | — | — | — |
+| AIME-18 | 33.33% (6/18) | — | — | — |
+
+Note: gpt-oss-20b was evaluated *without* the boxed instruction suffix. For apples-to-apples comparison with Instruct models, gpt-oss-20b will also be re-evaluated with the same suffix (OOD-1000 only) in the sweep.
+
+**Candidate models** (first wave, Instruct variants, no SFT/RL):
+
+| Model | HF ID | Params | Why |
+|-------|-------|--------|-----|
+| Llama 3.1 8B Instruct | `meta-llama/Meta-Llama-3.1-8B-Instruct` | 8B | Smallest; likely lowest accuracy → most headroom |
+| Qwen 2.5 14B Instruct | `Qwen/Qwen2.5-14B-Instruct` | 14B | Mid-range; Qwen2.5 known for strong math |
+| Qwen 2.5 32B Instruct | `Qwen/Qwen2.5-32B-Instruct` | 32B | Largest; may be near gpt-oss-20b level |
+
+**Selection criteria**:
+1. Primary: OOD-1000 greedy@1 in ~60–70% range (more headroom than 73.8%)
+2. Secondary: Higher boxed% and lower parse_fail% (less sparse RL reward signal)
+3. Tie-breaker: Smaller model preferred (faster RL iteration, lower GPU cost)
+
+**Eval protocol**:
+- Same OOD-1000 / ID-200 / AIME-18 pipeline
+- Greedy decoding (temp=0, n=1), max_tokens=4096, max_model_len=8192
+- Prompt: problem text + concise boxed suffix (`"Please reason step by step but keep it concise, and put your final answer within \boxed{...}."`)
+- Track per-problem: correct, parse_method, finish_reason, source bucket (MATH vs competition)
+- Report: overall accuracy, MATH/competition bucket accuracy, parse breakdown, truncation rate
+- Script: `eval_model_sweep.py`
+
+**Expected outcome**: Identify the model with optimal headroom for EM-GRPO. Then run a quick RL experiment on that model to definitively answer "does RL help at all?" with a clean paired McNemar test.
+
+### 11.28 Model Sweep Stage 1 Results: OOD-1000 (§11.27 execution)
+
+**Date**: 2026-02-25
+
+**Method**: Evaluated all 4 models on OOD-1000 (1000 problems) with identical settings: greedy decoding (temp=0, n=1), max_tokens=4096, max_model_len=8192, strengthened BOXED_SUFFIX prompt. Script: `eval_model_sweep.py --stage 1`.
+
+**BOXED_SUFFIX** (applied to all models):
+> "Please reason step by step but keep it concise, and put your final answer within \boxed{...}. In the final line, output ONLY \boxed{<integer>} and nothing else."
+
+**Results**:
+
+| Model | OOD-1000 | MATH(968) | Comp(32) | Boxed% | LN% | Fail% | Trunc% |
+|-------|----------|-----------|----------|--------|-----|-------|--------|
+| gpt-oss-20b | 83.50% (835/1000) | 86.26% | 0.00% | 86.2 | 0.0 | 13.8 | 14.2 |
+| llama3.1-8b | 49.00% (490/1000) | 50.62% | 0.00% | 77.5 | 22.5 | 0.0 | 28.8 |
+| **qwen2.5-14b** | **67.00% (670/1000)** | 69.11% | 3.13% | 99.2 | 0.8 | 0.0 | 30.8 |
+| qwen2.5-32b | 69.30% (693/1000) | 71.49% | 3.13% | 99.2 | 0.8 | 0.0 | 15.6 |
+
+**Key findings**:
+
+1. **BOXED_SUFFIX adds ~10pp to gpt-oss-20b**: 83.5% with suffix vs 73.8% without (§11.26). This is a prompt-engineering gain, not a model capability gain. The suffix forces structured output, reducing parse failures from ~17% to ~14% and improving answer extraction. This also means the true headroom gap on gpt-oss-20b was even smaller than §11.26 suggested — with the same prompt that RL models would use, the base model is at 83.5%, not 73.8%.
+
+2. **Both Qwen models land in the 60–70% target range**: qwen2.5-14b at 67.0% and qwen2.5-32b at 69.3%. These provide 30–33% of problems in the "model gets it wrong" zone, compared to only 16.5% for gpt-oss-20b with BOXED_SUFFIX.
+
+3. **Qwen models have near-perfect parsing**: 99.2% boxed rate, 0% parse failures. This means the EM reward signal will be clean — almost no problems lost to formatting noise. Contrast with gpt-oss-20b (13.8% parse failures) and llama3.1-8b (22.5% last-number fallback).
+
+4. **llama3.1-8b is too weak**: At 49.0%, over half the problems are wrong. While this gives maximum headroom, the model may lack the capability to solve these problems even with RL — too far below the "learning zone." Also has 22.5% last-number fallback and 28.8% truncation.
+
+5. **Competition problems remain near-zero for all models**: 0/32 for gpt-oss-20b and llama, 1/32 for both Qwen models. These problems are genuinely hard and unlikely to yield RL signal.
+
+6. **Truncation concern for qwen2.5-14b**: 30.8% truncation rate is high (vs 15.6% for qwen2.5-32b). The 14b model generates longer reasoning chains that hit the 4096-token max_tokens limit. This could suppress answer quality — some correct solutions may get cut off before reaching `\boxed{}`. For RL training, may need to increase max_tokens or the model may naturally learn shorter outputs under RL pressure.
+
+**Selection per §11.27 criteria**:
+
+| Criterion | qwen2.5-14b | qwen2.5-32b | Winner |
+|-----------|-------------|-------------|--------|
+| OOD-1000 in 60–70% | 67.0% ✓ | 69.3% ✓ | 14b (more headroom) |
+| Boxed% | 99.2% | 99.2% | Tie |
+| Fail% | 0.0% | 0.0% | Tie |
+| Model size | 14B | 32B | 14b (cheaper RL) |
+| Truncation | 30.8% ⚠ | 15.6% | 32b |
+
+**Recommendation**: **qwen2.5-14b** is the primary candidate. It has 3.3pp more headroom than qwen2.5-32b, half the parameter count (faster RL iterations, lower GPU cost), and identical parsing quality. The truncation concern (30.8%) is worth monitoring but may resolve naturally under RL: if the model learns to output shorter, more focused reasoning, truncation should decrease. If truncation proves problematic, qwen2.5-32b is the backup.
+
+**Next steps**:
+1. Run Stage 2 (ID-200 + AIME-18) for qwen2.5-14b and qwen2.5-32b to establish full baselines
+2. Set up RL training pipeline for qwen2.5-14b with EM-GRPO
+3. Run a short RL experiment (100–200 steps) and evaluate with paired McNemar test
+
+**Lesson #24**: The BOXED_SUFFIX prompt is a confound — it adds ~10pp to gpt-oss-20b accuracy. Always use identical prompts when comparing models, and use the same prompt for both baseline evaluation and RL training. The "no-suffix" baseline from §11.25–11.26 was comparing apples to oranges with the RL models that were trained with a suffix.
+
+**Provenance**:
+- Script: `eval_model_sweep.py`
+- Full results: `/mnt/scratch/model_sweep/sweep_stage1_summary.json`
+- Per-problem results: `/mnt/scratch/model_sweep/{model}_ood1000.jsonl`

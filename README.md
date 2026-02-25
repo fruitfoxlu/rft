@@ -169,6 +169,24 @@ See [rl_grpo_research.md](rl_grpo_research.md) for the full research log coverin
 - 21 lessons learned (LoRA accumulation bug, micro batch sizing, eval methodology, etc.)
 - Training metrics tables and diagnostic framework
 
+## Multi-Machine Setup
+
+| Machine | Role | Internal IP | Zone |
+|---------|------|-------------|------|
+| h100-8-4 | Primary (training) | `10.202.0.2` | us-east5-a |
+| h100-8-5 | Spare (eval/diagnostics) | `10.202.0.3` | us-east5-a |
+
+Both machines share identical environments: 8× H100 80GB, `rft` conda env, same packages, same patches, same data. The spare uses a **cache-first model sync strategy**: base models auto-download from HF, RL checkpoints sync as LoRA adapters (~50-200MB) and merge locally.
+
+**Dispatch an eval job on spare:**
+
+```bash
+SSH="ssh -i ~/.ssh/google_compute_engine rlu@10.202.0.3"
+$SSH 'tmux new-session -d -s eval-sweep "cd ~/Code/rft && conda activate rft && python eval_model_sweep.py --stage 1 2>&1 | tee /mnt/scratch/eval_spare/logs/sweep_stage1.log"'
+```
+
+See [spare_ops.md](spare_ops.md) for full sync/dispatch/monitor workflows, and `training_guideline.md` Section 13 for detailed setup documentation.
+
 ## Key Lessons
 
 1. **LoRA weight accumulation bug**: Syncing adapter weights to vLLM without resetting base causes silent drift — fixed by caching base weights and reconstructing each sync

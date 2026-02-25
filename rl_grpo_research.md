@@ -1,8 +1,34 @@
 # RL Fine-Tuning with GRPO: Research Log
 
-> **Goal**: RL fine-tune gpt-oss-120b on AIME math using Gemini 3 Pro as teacher/reward model.
+> **Goal**: Improve math reasoning via DR-GRPO with pure exact-match reward. Multi-model exploration: gpt-oss-120b (Phase 1) → gpt-oss-20b (Phase 2, A26-A30) → qwen2.5-14b (next).
 > **Framework**: OpenRLHF 0.9.3 + Ray + DeepSpeed ZeRO-3 + vLLM.
 > **Hardware**: 8x H100 80GB GPUs, 1TB boot NVMe, 1TB data NVMe, 5.9TB RAID-0 scratch.
+
+---
+
+## 0. Current State & Pivot History
+
+### Current Status (2026-02-25)
+
+- **RL on gpt-oss-20b showed zero measurable effect** (§11.26): paired McNemar test on OOD-1000 gives Δ=−0.40pp, p=0.783, 95% CI [−2.5, +1.7]. The 118 discordant problems (61 regressions, 57 improvements) confirm RL changes outputs but without directional improvement.
+- **Pivoting to qwen2.5-14b** (§11.28): model sweep identified qwen2.5-14b at 67.0% OOD-1000 (33% headroom) with 99.2% boxed rate — near-perfect EM reward signal.
+- **Current recipe**: DR-GRPO, pure EM reward, eps_clip=0.1, micro_train_batch_size=2, LoRA r=32.
+- **Key baselines**: gpt-oss-20b 73.8% OOD-1000 (no suffix) / 83.5% (with suffix); qwen2.5-14b 67.0%.
+- **Next steps**: Stage 2 eval (ID-200, AIME-18) for qwen2.5-14b, then RL experiment with paired McNemar test.
+- **SOP**: See §11.24 for experiment protocol. **Consolidated lessons**: See §12.
+
+### Pivot 1: gpt-oss-120b → gpt-oss-20b (Phase 1 → Phase 2, A25 → A26)
+
+- **Why**: 120b training was painfully slow (~13 min/step), required 4 GPUs for training + 4 for inference, CPU offloading, and complex weight sync. Attempts 19–25 were consumed by infrastructure bugs (OOM, NCCL, checkpoint disk, LoRA sync). Once training finally worked (A24–25), lack of diagnostics made it impossible to interpret results. The 120b setup allowed ~2 experiments per week.
+- **Decision**: Use 20b for rapid iteration — 3–6x faster per step, fits on fewer GPUs, allows more experimental cycles to perfect the training recipe (reward function, LR schedule, KL, eps_clip). Plan was to validate the recipe on 20b, then apply to 120b for the final run.
+- **Trade-off accepted**: Lower AIME baseline (28% vs 40%), but still in the "learnable" zone.
+
+### Pivot 2: gpt-oss-20b → model sweep / qwen2.5-14b (A30 → model sweep)
+
+- **Why**: After 5 training attempts on gpt-oss-20b (A26–A30, ~200 steps each, ~50 GPU-hours total), paired McNemar test against the base model showed **zero measurable effect** (Δ=−0.40pp, p=0.783, 95% CI [−2.5, +1.7]). The 118 discordant problems (61 regressions, 57 improvements) confirmed RL was changing outputs but without directional improvement.
+- **Root cause hypothesis**: Insufficient headroom. gpt-oss-20b scores 73.8% OOD-1000 (83.5% with boxed suffix), leaving only 16–26% of problems in the "learning zone." With binary EM reward, most rollouts either all succeed (no gradient signal) or all fail (model can't solve it, no useful contrast). The effective learning zone — problems the model sometimes gets right and sometimes wrong — is too narrow for GRPO to exploit.
+- **Decision**: Sweep candidate models targeting 60–70% OOD-1000 baseline (30–40% headroom). qwen2.5-14b landed at 67.0% with 99.2% boxed rate (near-perfect EM reward signal), half the params of 32b variant. Selected as next RL target.
+- **Trade-off accepted**: Switching models means the infrastructure patches (MXFP4 dequant, MoE dtype casting) may not apply. But qwen2.5-14b is a standard dense model — simpler training setup expected.
 
 ---
 
@@ -14,21 +40,21 @@
 │                                                                     │
 │  ┌──────────────────────┐    ┌──────────────────────────────────┐  │
 │  │  vLLM Rollout (4 GPU)│    │  Actor Training (4 GPU)          │  │
-│  │  Engine 0: GPU 0,1   │    │  DeepSpeed ZeRO-3 + CPU offload │  │
+│  │  Engine 0: GPU 0,1   │    │  DeepSpeed ZeRO-3               │  │
 │  │  Engine 1: GPU 2,3   │    │  GPU 4,5,6,7                    │  │
-│  │  TP=2, MXFP4 native  │    │  LoRA rank=64, alpha=128        │  │
+│  │  TP=2                │    │  LoRA rank=32, alpha=64          │  │
 │  └──────────┬───────────┘    └──────────────┬───────────────────┘  │
 │             │                                │                      │
 │             │ ◄── LoRA weight sync ──────────┘                      │
 │             │     (collective_rpc delta,                            │
-│             │      ~96 MB, ~18s)                                    │
+│             │      base-weight caching)                             │
 │             │                                                       │
 │             ▼                                                       │
 │  ┌──────────────────────┐    ┌──────────────────────────────────┐  │
-│  │  Generate 8 samples  │    │  Gemini Reward Function          │  │
-│  │  per prompt           │───▶│  0.6 * exact_match              │  │
-│  │  (rollout_batch=8)   │    │  + 0.4 * reasoning_quality      │  │
-│  └──────────────────────┘    │  Fallback: 3 models × 3 retries │  │
+│  │  Generate 8 samples  │    │  Pure Exact-Match Reward          │  │
+│  │  per prompt           │───▶│  reward = 1 if \boxed{} correct  │  │
+│  │  (rollout_batch=16)  │    │          0 otherwise              │  │
+│  └──────────────────────┘    │  Zero API cost, deterministic    │  │
 │                               └──────────────────────────────────┘  │
 └─────────────────────────────────────────────────────────────────────┘
 ```
@@ -38,23 +64,27 @@
 | Decision | Choice | Why |
 |----------|--------|-----|
 | RL algorithm | GRPO (dr_grpo) | Group-relative advantages; no critic model needed |
-| KL coefficient | 0 | Maximizes learning signal; risky for stability |
-| Weight sync | LoRA delta via collective_rpc | NCCL rendezvous fails; ray.get() deadlocks in compiled DAG; Ray object store used for transfer, collective_rpc for dispatch |
-| Param offload | CPU (ZeRO-3) | 234GB dequantized model / 4 GPUs = 58.5 GB/GPU; no room for activations |
+| KL coefficient | 0.001 | Non-zero for stability (learned from 120b instability at kl=0) |
+| eps_clip | 0.1 | Half of OpenRLHF default; eliminates late-run gradient spikes (§11.16) |
+| Weight sync | LoRA delta via collective_rpc | NCCL rendezvous fails; ray.get() deadlocks in compiled DAG; base-weight caching fixes accumulation bug (§11.19) |
+| Param offload | CPU (ZeRO-3) — 120b only | 234GB dequantized / 4 GPUs; 20b fits without offload |
 | Grad checkpointing | Reentrant | Non-reentrant validates tensor shapes; ZeRO-3 offload changes shapes |
 | Checkpoint format | LoRA-only (HF) | Full-model save was 203 GB; adapter_model.bin is 91 MB |
 | Quantization | MXFP4 (inference) / bf16 (training) | vLLM uses native MXFP4; actor dequantizes to bf16 for LoRA |
 
 ### Model Details
 
-- **Base model**: openai/gpt-oss-120b (120B params, MXFP4 quantized, ~30GB on disk)
-- **Dequantized**: ~234GB bf16 (for training actor)
-- **LoRA config**: rank=64, alpha=128, targets=q_proj,k_proj,v_proj,o_proj
-- **Trainable params**: 288 adapter parameter tensors, ~96 MB total
+- **Current target**: qwen2.5-14b (Qwen/Qwen2.5-14B-Instruct, 14B dense, 67.0% OOD-1000)
+- **Previous**: openai/gpt-oss-20b (21B MoE, 73.8% OOD-1000 — insufficient headroom)
+- **Phase 1**: openai/gpt-oss-120b (120B MoE, MXFP4 quantized, ~30GB on disk, ~234GB bf16 dequantized)
+- **LoRA config**: rank=32, alpha=64, targets=q_proj,k_proj,v_proj,o_proj (was rank=64, alpha=128 for 120b)
+- **Trainable params**: ~48 MB total (rank=32)
 
 ---
 
 ## 2. Training Configuration
+
+> **Archive (Phase 1 — gpt-oss-120b).** Current config: see §11.8.
 
 ```bash
 # train_grpo.sh — key hyperparameters
@@ -136,7 +166,7 @@ reasoning_quality:  Gemini 3 Pro rates solution quality on [0, 1] scale
   Correctness dropped to 9.4-14.1% at steps 16-17 once LR hit peak — could not
   diagnose root cause without gradient norms or advantage stats. Stopped to add monitoring.
 
-### Attempt 25: Enhanced metrics + LoRA weight sync rewrite (CURRENT)
+### Attempt 25: Enhanced metrics + LoRA weight sync rewrite (completed)
 - **Problem 1**: Attempt 24 lacked diagnostic metrics (no grad norms, advantage stats)
 - **Problem 2**: LoRA weight sync from actor→vLLM required 4 sub-attempts to fix:
   - **Sub-attempt A**: `ray.get()` inside vLLM compiled DAG worker → **deadlock**.
@@ -165,8 +195,35 @@ reasoning_quality:  Gemini 3 Pro rates solution quality on [0, 1] scale
     save-load-add pattern is universally compatible with TP sharding.
   - **Instrument before you train.** Without grad norms, advantage stats,
     and held-out eval, you can observe problems but not diagnose them.
-- **Status**: Running. Steps 1-2 completed successfully. Episode 1/50 in progress.
-  LoRA weight sync working reliably at 18s per sync.
+- **Status**: Completed. Infrastructure validated; moved to Phase 2 (gpt-oss-20b).
+
+### Attempt 26: NuminaMath EM-GRPO on gpt-oss-20b
+- **Problem 1**: GPU allocation hang — `init_kl_coef=0.001` creates ref model; default `ref_num_gpus_per_node=8` conflicted with 4 vLLM + 4 actor GPUs.
+- **Fix**: `--colocate_actor_ref --ref_num_gpus_per_node 4`.
+- **Problem 2**: MoE dtype mismatch — 192 gate/router params remained float32 after MXFP4 dequant, crashing ZeRO-3 optimizer step.
+- **Fix**: Cast all params to bf16 before `deepspeed.zero.Init()`.
+- **Result**: 60 steps completed, step 30 best (8/18 AIME = 44.4%), then degraded. LR was <6% of target due to `num_episodes` misconfiguration (500K actual steps vs ~40 expected).
+- **Lesson**: **MXFP4 MoE models need dtype casting before ZeRO-3** (#7). **Colocate actor and ref model when GPU budget is tight** (#8).
+
+### Attempt 27: eps_clip 0.2→0.1 + OOD probe eval
+- **Problem**: Same `num_episodes` bug — 125K actual steps, near-zero LR for entire run.
+- **Result**: Stopped at step 46. OOD stable 64–69% but effectively at near-zero LR. Spikes still present (grad=294 at step 9).
+- **Lesson**: **Understand `num_episodes` before launching** (#13). Always compute `max_steps` and verify LR schedule.
+
+### Attempt 28: Step-count fix (400-prompt pool, num_episodes=1)
+- **Problem**: `max_steps=200` counts gradient steps, not global steps. Each global step = 8 gradient steps → only 25 global steps completed.
+- **Result**: LR reached target (99.4% at step 3). Largest-ever spike: grad=2497 at step 16. Only 2 eval points — insufficient for A/B comparison.
+- **Lesson**: **`max_steps` counts gradient steps, not global steps** (#14). For N global steps, need `pool_size = N × rollout_batch_size` with `num_episodes=1`.
+
+### Attempt 29 A/B: Clean eps_clip comparison (3200 prompts, 200 global steps)
+- **Setup**: A=eps_clip=0.2, B=eps_clip=0.1. Same pool, same seed, 200 global steps each.
+- **Result**: OOD equivalent (~64.5% avg). But B has 3x fewer spikes, 4.4x smaller max grad, no spikes after step 71 (A has spikes through step 164). p99 ratio tails shrink with eps_clip=0.1, grow with 0.2.
+- **Lesson**: **eps_clip=0.1 eliminates late-run gradient spikes without sacrificing generalization** (#15).
+
+### Attempt 30: micro_train_batch_size 1→2
+- **Result**: 200 steps, 18% faster (114s vs 140s/step), no OOM, same OOD (~64.6%). Pipeline regression check: **PASS** (exact match in-training vs post-hoc after LoRA accumulation bug fix).
+- **Bug found & fixed**: LoRA weight accumulation in vLLM worker — `apply_lora_delta()` added full delta to already-delta'd weight. Fix: cache base weights, reconstruct each sync (#17).
+- **Lesson**: **Doubling micro_train_batch_size (1→2) gives ~18% speedup with no regression** (#19). **After fixing a pipeline bug, always run a quantitative regression check** (#20).
 
 ### Summary: What Broke and What Fixed It
 
@@ -180,10 +237,17 @@ reasoning_quality:  Gemini 3 Pro rates solution quality on [0, 1] scale
 | LoRA sync deadlock | `ray.get()` inside compiled DAG worker | Pass data via `collective_rpc` args instead | 25 |
 | Tensor serialization | msgspec can't serialize torch.Tensor | Convert to `(shape, dtype_str, list)` tuples | 25 |
 | `load_weights(add_to_existing)` | Not supported by GptOss model | Save-load-add pattern: clone param, load delta, add back | 25 |
+| GPU allocation hang | `colocate_actor_ref` needed with `init_kl_coef>0` | `--colocate_actor_ref --ref_num_gpus_per_node 4` | 26 |
+| MoE dtype mismatch | MXFP4 dequant leaves gates as float32 | Cast all params to bf16 before ZeRO-3 | 26 |
+| `num_episodes` miscalc | 50K × 8 / 16 × N = huge step count | Use small pool + `num_episodes=1` | 26→27→28 |
+| Gradient vs global steps | `max_steps` counts `optimizer.step()` not rollout cycles | 1 global step = `n_samples` gradient steps | 28 |
+| LoRA weight accumulation | `apply_lora_delta` added full delta to already-delta'd weight | Cache base weights, reconstruct each sync | 30 |
 
 ---
 
 ## 4. Training Metrics — Attempt 24
+
+> **Archive.** Current training data: see §11.10 (A26), §11.16 (A29), §11.21 (A30).
 
 ### 4.1 Per-Step Summary (Global Steps 1–17)
 
@@ -237,6 +301,8 @@ At step 11, a loss spike appeared: `act_loss=2.69` (10x normal range). This reco
 - **Gemini API**: Intermittent 429 RESOURCE_EXHAUSTED (burst of 64 concurrent requests exceeds quota). Fallback chain resolves most failures.
 
 ## 4b. Training Metrics — Attempt 25
+
+> **Archive.** Current training data: see §11.10 (A26), §11.16 (A29), §11.21 (A30).
 
 ### 4b.1 Per-Step Summary (in progress)
 
@@ -305,13 +371,14 @@ The working LoRA sync pipeline (after 4 sub-attempts):
 
 ## 5. Baseline Scores
 
+> **Phase 1 baselines. For current baselines (OOD-1000), see §11.25–§11.28.**
+
 | Model | Dataset | Metric | Score | Date | Config |
 |-------|---------|--------|-------|------|--------|
 | Teacher (Gemini 3 Pro) | AIME eval (18) | Exact Match | **100.0%** (18/18) | 2026-02-21 | thinking_level=high, max_output_tokens=16384 |
 | Teacher (Gemini 3 Pro) | AIME eval (18) | Exact Match | **0.0%** (0/18) | 2026-02-21 | no thinking, max_output_tokens=4096 |
 | Teacher (Gemini 3 Pro) | MATH45 eval (30) | Exact Match | **20.0%** (6/30) | 2026-02-21 | no thinking, max_output_tokens=4096 |
 | Base Student (gpt-oss-120b) | AIME train (72) | pass@1 (estimate) | **~39.5%** (steps 1-4 avg) | 2026-02-21 | generate_max_len=3072 |
-| Base Student (gpt-oss-120b) | AIME eval (18) | pass@1 | TBD | — | |
 | **Base Student (gpt-oss-20b)** | **AIME eval (18)** | **pass@1** | **27.8%** (5/18) | 2026-02-21 | max_tokens=3072, temp=0.0 |
 | **Base Student (gpt-oss-20b)** | **MATH45 eval (18)** | **pass@1** | **44.4%** (8/18) | 2026-02-21 | max_tokens=3072, temp=0.0 |
 
@@ -369,14 +436,9 @@ Gemini 3 Pro achieves 100% on AIME — far exceeding the student's ~40%. This me
 3. However, enabling thinking mode in the reward function will significantly increase
    API costs and latency (each reward call will take longer due to extended reasoning).
 
-**Action required**: Update `reward_func.py` to use `thinking_level=high` and
-`max_output_tokens=16384` when calling Gemini for reasoning quality assessment.
-Alternatively, since the teacher is so capable, consider restructuring the reward:
-- **Option A**: Keep current weights, enable thinking mode in reward calls
-- **Option B**: Increase correctness weight (0.8/0.2) since teacher can verify correctness
-  itself, reducing the need for separate reasoning quality scoring
-- **Option C**: Use Gemini with thinking to VERIFY correctness instead of/in addition to
-  regex-based exact match, then use pure EM for reward
+**Action required**: ~~Update `reward_func.py` to use `thinking_level=high` and
+`max_output_tokens=16384` when calling Gemini for reasoning quality assessment.~~
+**Superseded**: reward function switched to pure EM — no Gemini dependency (§11.7).
 
 ### 5.3 Student Baseline
 
@@ -423,11 +485,10 @@ reward function, hyperparameters, etc.) at the cost of a lower AIME baseline (28
 to gpt-oss-120b for the final training run.
 
 ### 5.4 Action Items
-- [ ] Run proper gpt-oss-120b baseline with eval_baseline.py (vLLM server crashed on
-  startup — needs debugging, likely CUDA_VISIBLE_DEVICES conflict)
-- [ ] For future training runs: add `--eval_steps 1` to force step-0 eval
-- [x] Update `reward_func.py` to use Gemini thinking mode (pending decision on approach)
-- [ ] Decide on student model: gpt-oss-20b (fast iteration) vs 120b (higher ceiling)
+- ~~[ ] Run proper gpt-oss-120b baseline with eval_baseline.py~~ — Abandoned; pivoted away from 120b
+- [x] For future training runs: add `--eval_steps 1` to force step-0 eval — Done in A27+
+- [x] Update `reward_func.py` to use Gemini thinking mode — Superseded: switched to pure EM (§11.7)
+- [x] Decide on student model — Resolved: used 20b for A26–A30, now pivoting to qwen2.5-14b (§11.27)
 
 ---
 
@@ -469,7 +530,7 @@ to gpt-oss-120b for the final training run.
 | **Length collapse** | Response length drops sharply | Degeneration | Add length penalty, check entropy, add KL constraint |
 | **Truncation ↑** | >80% responses truncated | Model rambling | Increase max_len or add length penalty in reward |
 
-### 6.3 Current Diagnosis (Attempt 24, Step 10)
+### 6.3 Historical Diagnosis (Attempt 24, Step 10)
 
 Based on the tuning playbook:
 - **Scenario**: Mostly "Flat learning" (Scenario 1). KL is near zero, LR still in warmup, no clear EM improvement yet.
@@ -556,28 +617,21 @@ All patches are in `patches/` and applied via `bash apply_patches.sh`.
 
 ## 9. Held-Out Evaluation Results
 
-> Will be populated as checkpoints are evaluated.
-
-| Checkpoint | AIME pass@1 | AIME pass@8 | Notes |
-|-----------|-------------|-------------|-------|
-| Base model | TBD | TBD | Pre-training baseline |
-| Step 10 | TBD | TBD | First checkpoint, still in LR warmup |
-| Step 20 | TBD | TBD | |
-| Final | TBD | TBD | |
+> Moved to §11.17 (post-hoc A29), §11.23 (3-checkpoint comparison), §11.25 (OOD-1000 baseline).
 
 ---
 
 ## 10. Open Questions
 
-1. **Is 72 AIME problems enough training data?** With 50 episodes × 72 problems = 3600 training iterations, the model sees each problem ~50 times. Risk of overfitting to AIME formats vs learning general math reasoning.
+1. **Is 72 AIME problems enough training data?** [Superseded — switched to 50K NuminaMath pool (§11.3)] With 50 episodes × 72 problems = 3600 training iterations, the model sees each problem ~50 times. Risk of overfitting to AIME formats vs learning general math reasoning.
 
-2. **Should we add KL regularization?** Currently `init_kl_coef=0`. The model is free to drift arbitrarily from the base policy. May be fine for short runs but risky for 50 episodes.
+2. **Should we add KL regularization?** [Resolved — using `init_kl_coef=0.001` since A26] Currently `init_kl_coef=0`. The model is free to drift arbitrarily from the base policy. May be fine for short runs but risky for 50 episodes.
 
-3. **Is the Gemini reasoning quality signal helpful or harmful?** It provides smoother gradients than pure EM, but could incentivize "judge-pleasing" reasoning patterns rather than correct solutions.
+3. **Is the Gemini reasoning quality signal helpful or harmful?** [Superseded — switched to pure EM reward (§11.7)] It provides smoother gradients than pure EM, but could incentivize "judge-pleasing" reasoning patterns rather than correct solutions.
 
 4. **Optimal group size?** Currently `n_samples_per_prompt=8`. Larger groups (16, 32) give better advantage estimates but cost more compute per step. With AIME's low solve rate, larger groups may be critical.
 
-5. **Should we use MATH Level 4-5 instead of (or in addition to) AIME?** AIME may be too hard for meaningful learning signal. The teacher (Gemini) scores 0% on AIME but 20% on MATH — suggesting MATH problems are in the "learnable" difficulty range.
+5. **Should we use MATH Level 4-5 instead of (or in addition to) AIME?** [Superseded — training on NuminaMath, eval on OOD-1000 (§11.24)] AIME may be too hard for meaningful learning signal. The teacher (Gemini) scores 0% on AIME but 20% on MATH — suggesting MATH problems are in the "learnable" difficulty range.
 
 6. **Teacher-student capability inversion (RESOLVED).** Previously appeared that the
    teacher scored 0% on AIME while the student scored ~40%. Root cause: Gemini was not
@@ -586,7 +640,7 @@ All patches are in `patches/` and applied via `bash apply_patches.sh`.
    AIME eval (18/18). The teacher is far more capable than the student. The reward function
    needs to be updated to enable thinking mode. See Section 5.1 for full analysis.
 
-7. **gpt-oss-20b as student model?** With only 21B total params (3.6B active), gpt-oss-20b
+7. **gpt-oss-20b as student model?** [Resolved — used 20b for A26–A30; now pivoting to qwen2.5-14b (§11.27)] With only 21B total params (3.6B active), gpt-oss-20b
    would train much faster, fit on fewer GPUs, and allow more experimental iterations.
    However, its baseline AIME performance is unknown and likely lower than 120b's ~40%.
    Need to evaluate before deciding. Key trade-off: faster iteration vs lower ceiling.
@@ -614,13 +668,11 @@ All patches are in `patches/` and applied via `bash apply_patches.sh`.
 
 ---
 
-*Last updated: 2026-02-21. Attempt 26 concluded (step 60+, degrading). Step 30 locked as best checkpoint (8/18 AIME).
-Attempt-27 stopped at step 46 — discovered num_episodes misconfiguration (125K actual steps vs ~40 expected). OOD eval stable (64-69%) but LR was only 5.8% of target. Both A26 and A27 effectively trained at near-zero LR.
-Next: recalibrate step budget and rerun with correct schedule.*
+*Last updated: 2026-02-25. Model sweep complete (§11.28): qwen2.5-14b selected as next RL target (67% OOD-1000, 33% headroom). RL on gpt-oss-20b showed zero measurable effect (§11.26). A30 step 130 pinned as Baseline-SOTA (73.5% OOD-1000).*
 
 ---
 
-## 11. Phase 2: SFT → RL Pipeline for gpt-oss-20b
+## 11. Phase 2: EM-GRPO Experiments
 
 ### 11.1 Decision: Student Model = gpt-oss-20b
 
@@ -2151,14 +2203,146 @@ Note: gpt-oss-20b was evaluated *without* the boxed instruction suffix. For appl
 
 **Recommendation**: **qwen2.5-14b** is the primary candidate. It has 3.3pp more headroom than qwen2.5-32b, half the parameter count (faster RL iterations, lower GPU cost), and identical parsing quality. The truncation concern (30.8%) is worth monitoring but may resolve naturally under RL: if the model learns to output shorter, more focused reasoning, truncation should decrease. If truncation proves problematic, qwen2.5-32b is the backup.
 
-**Next steps**:
-1. Run Stage 2 (ID-200 + AIME-18) for qwen2.5-14b and qwen2.5-32b to establish full baselines
-2. Set up RL training pipeline for qwen2.5-14b with EM-GRPO
-3. Run a short RL experiment (100–200 steps) and evaluate with paired McNemar test
-
 **Lesson #24**: The BOXED_SUFFIX prompt is a confound — it adds ~10pp to gpt-oss-20b accuracy. Always use identical prompts when comparing models, and use the same prompt for both baseline evaluation and RL training. The "no-suffix" baseline from §11.25–11.26 was comparing apples to oranges with the RL models that were trained with a suffix.
 
 **Provenance**:
 - Script: `eval_model_sweep.py`
 - Full results: `/mnt/scratch/model_sweep/sweep_stage1_summary.json`
 - Per-problem results: `/mnt/scratch/model_sweep/{model}_ood1000.jsonl`
+
+### 11.29 Model Sweep Stage 2: ID-200 + AIME-18 + Truncation Sensitivity
+
+**Date**: 2026-02-25
+
+#### Stage 2 Results (ID-200 + AIME-18)
+
+**Method**: Evaluated qwen2.5-14b and qwen2.5-32b on ID-200 and AIME-18 with identical settings to Stage 1 (greedy, temp=0, max_tokens=4096, BOXED_SUFFIX). Script: `eval_model_sweep.py --stage 2 --models qwen2.5-14b qwen2.5-32b`.
+
+**Results (combined with Stage 1 OOD-1000)**:
+
+| Model | OOD-1000 | ID-200 | AIME-18 | Boxed% (all sets) |
+|-------|----------|--------|---------|-------------------|
+| **qwen2.5-14b** | **67.0%** (670/1000) | **69.5%** (139/200) | 16.7% (3/18) | 99–100% |
+| qwen2.5-32b | 69.3% (693/1000) | 72.5% (145/200) | 16.7% (3/18) | 99–100% |
+
+**Observations**:
+
+1. **ID-200 tracks OOD-1000**: qwen2.5-14b at 69.5% and qwen2.5-32b at 72.5% — the ~2.5pp gap between models is consistent across both eval sets. ID-200 is a viable secondary guardrail for detecting overfitting vs OOD generalization during RL.
+
+2. **AIME-18 is identical**: Both models solve exactly 3/18 AIME problems (16.7%). As expected, AIME is sanity-only — too small (N=18) for statistical discrimination and too hard for either model to score meaningfully.
+
+3. **Parsing remains perfect**: 100% boxed rate on both ID-200 and AIME-18 for both Qwen models. Zero parse failures across all eval sets.
+
+#### Truncation Sensitivity Check (qwen2.5-14b)
+
+**Method**: Evaluated qwen2.5-14b on the first 200 OOD-1000 problems with max_tokens=4096 vs max_tokens=2048 (same BOXED_SUFFIX, same server instance). Script: `eval_trunc_sensitivity.py`.
+
+**Results**:
+
+| Setting | Accuracy | Boxed% | Trunc% (finish_reason=length) |
+|---------|----------|--------|-------------------------------|
+| max_tokens=4096 | 57.0% (114/200) | 98.0% | 2.0% |
+| max_tokens=2048 | 60.0% (120/200) | 98.5% | 1.5% |
+| **Δ (2048 − 4096)** | **+3.0pp** | +0.5 | −0.5 |
+
+**Paired analysis (N=200)**:
+- Both correct: 108
+- Only 4096 correct: 6
+- Only 2048 correct: 12
+- Both wrong: 74
+
+**Key insight**: The 30.8% "truncation rate" reported in Stage 1 (§11.28) was from the heuristic `is_truncated()` function (long output + no boxed OR ends mid-sentence), **not** from actually hitting the token limit. Only 2.0% of responses actually have `finish_reason=length`. The heuristic was misleadingly high.
+
+More importantly, **max_tokens=2048 is not just viable — it's slightly better** (+3.0pp, with 12 vs 6 discordants favoring 2048). The model doesn't productively use the extra 2048 tokens. Shorter max_tokens forces more concise reasoning without sacrificing accuracy.
+
+**Decision**: Standardize **max_tokens=2048** as the canonical setting for qwen2.5-14b going forward. This halves per-rollout token generation during RL training, directly reducing compute cost.
+
+#### Final Selection
+
+**Primary RL candidate: qwen2.5-14b** (confirmed)
+
+| Property | Value |
+|----------|-------|
+| OOD-1000 baseline | 67.0% (330 wrong → learning zone) |
+| ID-200 baseline | 69.5% (secondary guardrail) |
+| AIME-18 baseline | 16.7% (sanity only) |
+| Boxed parse rate | 99–100% (clean EM reward) |
+| Parse failures | 0% |
+| Canonical max_tokens | 2048 |
+| TP requirement | 2 GPUs |
+| Backup model | qwen2.5-32b (69.3% OOD, 72.5% ID) |
+
+**Next steps**:
+1. Set up RL training pipeline for qwen2.5-14b with EM-GRPO (max_tokens=2048)
+2. Run a single clean RL experiment (100–200 steps)
+3. Evaluate with paired McNemar test on OOD-1000 (paired records + CI)
+4. Only run confirmation seed if Gate-1a/1b looks promising
+
+**Lesson #25**: Measure truncation by `finish_reason`, not by heuristic response-length checks. The heuristic `is_truncated()` (no boxed + long output) conflates "model wrote a long response without boxing" with "model was cut off by token limit." In this case, the heuristic reported 30.8% truncation while actual token-limit truncation was only 2.0%. Halving max_tokens from 4096 to 2048 had no negative effect on accuracy.
+
+**Provenance**:
+- Stage 2: `/mnt/scratch/model_sweep/sweep_stage2_summary.json`, `{model}_{id200,aime}.jsonl`
+- Truncation: `/mnt/scratch/model_sweep/trunc_sensitivity/trunc_sensitivity_summary.json`
+- Scripts: `eval_model_sweep.py`, `eval_trunc_sensitivity.py`
+
+---
+
+## 12. Consolidated Lessons
+
+All lessons from §11 in one numbered list, grouped by category, with back-references to the originating section.
+
+### Infrastructure
+
+**#7** (§11.11, A26): MXFP4 MoE models need dtype casting before ZeRO-3. MXFP4 dequantization leaves router/gate parameters as float32 while other parameters become bf16. ZeRO-3's all-gather requires uniform dtype. Cast all parameters to bf16 before `deepspeed.zero.Init()`.
+
+**#8** (§11.11, A26): Colocate actor and ref model when GPU budget is tight. With `--colocate_actor_ref`, both share the same GPUs. The ref model only does forward passes (no gradients), so memory overhead is minimal with ZeRO-3.
+
+**#17** (§11.19, A30): When implementing LoRA weight sync to a separate inference engine, distinguish between "full delta" (the complete LoRA contribution `scaling * B @ A`) and "incremental delta" (the change from the previous step). If sending the full delta, the receiver must subtract the old delta before adding the new one, or cache the base weights and reconstruct from scratch.
+
+**#19** (§11.20, A30): Doubling `micro_train_batch_size` from 1→2 does not cause OOM and actually reduces training time by ~18% (fewer micro-batch forward/backward passes, better GPU utilization). The previous cache flush warnings with micro=1 disappear.
+
+**#20** (§11.22, A30): After fixing a pipeline bug, always run a quantitative regression check (same checkpoint, both eval paths, identical settings) to confirm the fix works in the actual training pipeline — not just in isolation. The unit test validated a single layer; the regression check validates the full end-to-end pipeline.
+
+### RL Training Dynamics
+
+**#1** (§11.11, A26): Grad norm spikes come from ratio outliers, not advantage outliers. Advantage clipping won't fix spikes — tighter `eps_clip` or per-micro-batch gradient clipping are the correct interventions.
+
+**#2** (§11.11, A26): Spikes escalate over training but are individually harmless. The model recovers within 1 step after each spike (post-clipping). However, the escalation correlates with declining eval performance — suggesting even clipped spikes inject noise that accumulates in LoRA parameters.
+
+**#5** (§11.11, A26): Pre-clipping `grad_norm` is the metric to log, not post-clipping. Large values don't mean the model is damaged — they mean clipping is working. But the magnitude trend over training tells you whether the policy is diverging.
+
+**#6** (§11.11, A26): Step-to-step correctness is too noisy for trend detection. With batch size 16 and 8 samples per prompt, each step evaluates ~128 samples from a random subset. Use 10-step rolling averages or a fixed probe set for reliable progress tracking.
+
+**#11** (§11.11, A26): KL ≈ 0 is expected with small `init_kl_coef` and early training. With `init_kl_coef=0.001`, the KL penalty is negligible. If KL stays near zero after 50+ steps, the LR may be too low.
+
+**#12** (§11.11, A26): The training horizon is shorter than you think. With LoRA rank=32 and 50K training problems, the best checkpoint was at step 30 (~3 episodes). Over-training LoRA adapters is easy — they have limited capacity and quickly memorize the training distribution.
+
+**#15** (§11.16, A29): `eps_clip=0.1` (half the OpenRLHF default of 0.2) eliminates late-run gradient spikes without sacrificing generalization. For LoRA GRPO with binary reward and small batch sizes (`micro_train_batch_size=1`), tighter clipping is advisable because individual extreme-ratio tokens dominate the per-micro-batch gradient.
+
+### Evaluation & Metrics
+
+**#3** (§11.11, A26): Train/eval divergence is the key signal to stop. Training correctness improved steadily while held-out pass@1 degraded below pre-training baseline. An ID-only probe set would miss this. Use separate ID and OOD probes.
+
+**#4** (§11.11, A26): Separate ID and OOD probe sets for different signals. ID probe (from training pool) measures learning/stability for early stopping. OOD probe (disjoint from pool) measures generalization for checkpoint selection. Tiny held-out set (AIME, N=18) is sanity check only.
+
+**#9** (§11.11, A26): Eval config matters — clearly label your metrics. Three distinct modes: `greedy_pass@1` (temp=0, n=1), `sampling_pass@8` (temp>0, n=8), and `nondet_proxy_pass@8` (temp=0, n=8). Never conflate them.
+
+**#10** (§11.11, A26): `has_boxed` is a format compliance proxy, not a reward signal. Track it to detect if the model is losing `\boxed{}` ability, but don't over-optimize for it. The real signal is held-out eval accuracy.
+
+**#16** (§11.17, A29): Post-hoc eval on N=200 probe sets has SE≈3.4%, giving 95% CI of ±6.7pp. Distinguishing checkpoints within ~5pp requires larger eval sets or multiple-seed evaluation. In-training OOD eval (many evaluation points, averaged) can provide more signal.
+
+**#18** (§11.19, A30): Always validate in-training eval against an independent post-hoc eval pipeline on a subset of checkpoints. Discrepancies exceeding expected noise (SE ≈ sqrt(p(1-p)/N)) indicate a pipeline bug.
+
+**#21** (§11.23, A30): When comparing hyperparameter changes, post-hoc eval on multiple checkpoints (best + final) with identical settings is essential. In-training eval curves are noisy (±3pp step-to-step). Compare best-vs-best and final-vs-final to separate the hyperparameter effect from checkpoint selection noise.
+
+**#23** (§11.26, A30): Always evaluate the base model (Baseline-S0, no LoRA) before declaring RL success. In-training metrics can be misleading — they may reflect noise or overfitting. The only trustworthy signal is a paired comparison on a large held-out set with proper statistical tests. In this case, 30+ hours of RL on gpt-oss-20b produced zero detectable improvement (Δ=−0.40pp, p=0.78).
+
+**#24** (§11.28, model sweep): The BOXED_SUFFIX prompt is a confound — it adds ~10pp to gpt-oss-20b accuracy. Always use identical prompts when comparing models, and use the same prompt for both baseline evaluation and RL training.
+
+**#25** (§11.29, model sweep): Measure truncation by `finish_reason`, not by heuristic response-length checks. The heuristic conflates "model wrote a long response without boxing" with "model was cut off by token limit." Halving max_tokens from 4096 to 2048 had no negative effect on qwen2.5-14b accuracy.
+
+### Step Counting & Configuration
+
+**#13** (§11.11, A26–A27): Understand `num_episodes` before launching. In OpenRLHF, `total_steps = len(prompts) * n_samples_per_prompt // train_batch_size * num_episodes * max_epochs`. With 50K prompts and num_episodes=5, this yields 125,000 steps — not ~40. Always compute `max_steps` before launching and verify the LR schedule reaches meaningful values within your intended step budget.
+
+**#14** (§11.11, A28): `max_steps` counts gradient steps, not global steps. Each global step contains `n_samples_per_prompt * rollout_batch_size / train_batch_size` gradient steps. For N global steps, you need `pool_size = N * rollout_batch_size` with `num_episodes=1`.

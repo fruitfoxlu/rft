@@ -1973,12 +1973,93 @@ When STOP-3 triggers, classify the bottleneck and choose the next single-variabl
 - Rationale: from the fixed pipeline (no LoRA accumulation bug), micro=2 default, and the best-by-monitor checkpoint
 - All future runs compare against this baseline
 
-**Baseline-S0**: Not yet evaluated (base model with no LoRA). Will be evaluated before A31 per SOP §0.
+**Baseline-S0**: Evaluated in §11.26 below — **RL has zero measurable effect**.
 
 **Provenance**:
 - OOD-1000: `data/probe_set_1000_ood.jsonl` SHA256: `5700782fa9a6b5f0e01ce60f0e239d25ec0e8a49954f656d4cb9bd37c42f264b`
 - ID-200: `data/probe_set_200.jsonl` SHA256: `cee48574208d948163401a9421bb01963726ca0680d810dd2acf69e819b16384`
 - AIME-18: `data/aime_eval.jsonl` SHA256: `856a54bf509acf5824893ac0929facf51408cc7cd40b88c12e9d620e1cfd55b0`
 - Full results: `/mnt/scratch/posthoc_eval_ood1000_baseline.json`
+
+### 11.26 Baseline-S0 vs Baseline-SOTA: Does RL Help At All?
+
+**Purpose**: Answer the fundamental question — does RL training produce any measurable improvement over the raw base model? This is a prerequisite before investing in further recipe tuning (A31+).
+
+**Method**: Evaluated both models on OOD-1000, ID-200, and AIME-18 using identical settings (greedy, temp=0, n=1, max_tokens=4096, same parser). Per-problem results saved with content-hash keys for paired comparison. Script: `eval_baseline_s0.py`.
+
+- **Baseline-S0**: `openai/gpt-oss-20b` — raw base model, no LoRA adapter
+- **Baseline-SOTA**: `/mnt/scratch/merged_models/a30_step130` — best RL checkpoint (A30, step 130, merged)
+
+**Results**:
+
+| Model | OOD-1000 | ID-200 | AIME-18 |
+|-------|----------|--------|---------|
+| Baseline-S0 (no LoRA) | 73.80% (738/1000) | 51.50% (103/200) | 33.33% (6/18) |
+| Baseline-SOTA (A30 s130) | 73.40% (734/1000) | 51.00% (102/200) | 27.78% (5/18) |
+| Δ (SOTA − S0) | **−0.40pp** | −0.50pp | −5.56pp |
+
+**Paired Statistics (OOD-1000)**:
+- N (paired problems): 1000
+- Discordants: b=61 (S0 correct, SOTA wrong), c=57 (S0 wrong, SOTA correct)
+- Net improvement: c − b = −4 problems
+- McNemar exact p-value: **0.783** (far from significant)
+- Bootstrap 95% CI for Δ: [−2.50pp, +1.70pp]
+- SOP Gate check: **Neither Gate-1a nor Gate-1b passes** (Δ is negative)
+
+**Paired Statistics (ID-200)**:
+- N (paired problems): 200
+- Discordants: b=11 (S0 correct, SOTA wrong), c=10 (S0 wrong, SOTA correct)
+- Net improvement: c − b = −1 problem
+- McNemar exact p-value: **1.000**
+- Bootstrap 95% CI for Δ: [−5.00pp, +4.00pp]
+
+**Diagnostic Analysis**:
+
+*Bucket breakdown (OOD-1000)*:
+- MATH45 subset (N=968): Base=76.2%, RL=75.8%, Δ=−0.4pp — same story
+- Competition subset (N=32): **0% for both models** — neither model solves any competition problem
+- The competition problems are too hard for this model; all signal is in MATH45
+
+*Parse-method distribution*:
+- Both models: ~71% boxed, ~12% last_number, ~17% fail
+- No meaningful difference in parsing behavior between base and RL
+
+*Mis-parse heuristic*: 24% upper bound (problems where extracted answer ≠ truth but output text is long enough to potentially contain a correct answer). Needs manual review to determine actual mis-parse rate, but this affects both models equally.
+
+**Interpretation**:
+
+RL training (A29A through A30, ~200 gradient steps of DR-GRPO with exact-match reward) has produced **zero measurable improvement** on OOD-1000. The 61/57 discordant split is consistent with random noise (p=0.78). The RL model is neither better nor worse — the LoRA adapter is effectively doing nothing detectable on held-out problems.
+
+This means all previous "improvements" observed in-training (reward curves going up, OOD-202 fluctuations) were either:
+1. Overfitting to the training pool (without OOD generalization)
+2. Noise in small eval sets (OOD-202 SE≈3.4%)
+3. Some combination of both
+
+**Implications per SOP fault tree** (§11.24 §8):
+
+Before proceeding with A31+ recipe changes, we need to classify the bottleneck:
+
+- **(A) Reward Sparsity / Signal**: With exact-match binary reward and greedy decoding already at 73.8%, the base model answers ~74% of problems correctly. The reward signal may be too sparse to drive learning — most rollouts either all get it right or all get it wrong, leaving few informative contrasts for GRPO advantages.
+
+- **(B) LoRA Capacity**: rank=64 with only attention QKV projections. The adapter may not have enough capacity to modify the model's reasoning, or may need to target additional modules (MLP, output projections).
+
+- **(C) Data Distribution**: The training pool may not contain enough problems in the difficulty range where the model can learn (currently wrong ~26% of the time on MATH45, and 100% wrong on competition).
+
+- **(D) RL Dynamics**: Peak performance at step 130/200 suggests the LR schedule may overshoot. With KL coefficient = 0, there's no regularization pulling back toward the base model.
+
+The most concerning signal is that the discordant count (b+c=118, or 12.2% of problems) is substantial — RL *does* change which problems the model gets right, but the net effect is zero. This suggests the RL signal exists but is directionless.
+
+**Next steps** (ordered by diagnostic value):
+1. **Pass@k headroom check**: Generate k=8 samples on problems where base model greedy is wrong (~262 problems). If pass@k is near 0%, the model genuinely cannot solve these and reward signal is absent. If pass@k is substantial, RL should be able to exploit it.
+2. **Training reward curve deep-dive**: Check if training pool accuracy actually improved during RL (it should have). If it did, the issue is OOD generalization (overfitting). If it didn't, the issue is RL dynamics.
+3. **Discordant analysis**: Examine the 118 discordant problems (61 regressions + 57 improvements) for patterns — are regressions concentrated in specific topics?
+
+**Lesson #23**: Always evaluate the base model (Baseline-S0, no LoRA) before declaring RL success. In-training metrics (reward curves, in-run OOD monitors) can be misleading — they may reflect noise (small eval sets) or overfitting (training pool accuracy going up without OOD transfer). The only trustworthy signal is a paired comparison on a large held-out set with proper statistical tests. In this case, 30+ hours of RL training on gpt-oss-20b with DR-GRPO produced zero detectable improvement on OOD-1000 (Δ=−0.40pp, p=0.78).
+
+**Provenance**:
+- Script: `eval_baseline_s0.py`
+- Full results: `/mnt/scratch/baseline_s0_eval/baseline_comparison.json`
+- Per-problem results: `/mnt/scratch/baseline_s0_eval/s0_ood1000.jsonl`, `sota_ood1000.jsonl`
+- Paired records: `/mnt/scratch/baseline_s0_eval/paired_records_s0_sota_ood1000.jsonl`
 
 **Lesson #22**: OOD-202 was giving misleading checkpoint-selection signals (+2.5pp difference that turned out to be noise on OOD-1000). At SE≈3.4%, differences up to ~7pp can appear by chance. OOD-1000 (SE≈1.5%) resolves this — differences >3pp are likely real, and the flat results here (Δ<0.2pp) give high confidence that all three checkpoints are truly equivalent. Always use the largest available probe for decisions; use the smaller probe for in-training monitoring only.

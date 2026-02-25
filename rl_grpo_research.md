@@ -2285,6 +2285,130 @@ More importantly, **max_tokens=2048 is not just viable — it's slightly better*
 - Truncation: `/mnt/scratch/model_sweep/trunc_sensitivity/trunc_sensitivity_summary.json`
 - Scripts: `eval_model_sweep.py`, `eval_trunc_sensitivity.py`
 
+### 11.30 Attempt Q1 Design: qwen2.5-14b EM-GRPO (RL-vs-noRL Test)
+
+**Date**: 2026-02-25
+
+**Goal**: Definitively answer "does RL (DR-GRPO with EM reward) produce measurable OOD improvement?" using a model with sufficient headroom. This is the clean paired test that gpt-oss-20b could not provide (§11.26: zero effect at 73.8% baseline).
+
+#### Model & Baseline
+
+| Property | Value |
+|----------|-------|
+| Model | `Qwen/Qwen2.5-14B-Instruct` (14B dense, bf16) |
+| OOD-1000 baseline | 67.0% (670/1000) — 33% error zone |
+| ID-200 baseline | 69.5% (139/200) |
+| AIME-18 baseline | 16.7% (3/18) |
+| Boxed parse rate | 99–100% |
+| Canonical max_tokens | 2048 (§11.29 truncation study) |
+
+#### Training Configuration (Q1 vs A30)
+
+| Parameter | A30 (gpt-oss-20b) | Q1 (qwen2.5-14b) | Rationale |
+|-----------|-------------------|-------------------|-----------|
+| `--pretrain` | `openai/gpt-oss-20b` | `Qwen/Qwen2.5-14B-Instruct` | New model |
+| `--generate_max_len` | 4096 | 2048 | §11.29: no accuracy loss |
+| `--max_len` | 5120 | 3072 | prompt(1024) + gen(2048) |
+| `--prompt_data` | `sft_rl_pool_3200.jsonl` | `sft_rl_pool_3200_boxed.jsonl` | BOXED_SUFFIX appended |
+| `--eval_dataset` | `probe_set_200_ood.jsonl` | `probe_set_200_ood_boxed.jsonl` | BOXED_SUFFIX appended |
+| `--vllm_num_engines` | 2 | 4 | TP=1 → 4 engines |
+| `--vllm_tensor_parallel_size` | 2 | 1 | 14B bf16 (~28GB) fits 1 GPU |
+
+**Unchanged** (proven across 30 experiments):
+- Algorithm: `dr_grpo`, `eps_clip=0.1`, `init_kl_coef=0.001`
+- LoRA: `rank=32`, `alpha=64`, targets `q_proj k_proj v_proj o_proj` (Qwen2.5 uses same names)
+- Batch: `rollout_batch_size=16`, `train_batch_size=16`, `micro_train_batch_size=2`
+- Sampling: `n_samples_per_prompt=8`
+- LR: `5e-7` cosine decay, `warmup_ratio=0.05`, `min_lr=5e-8`
+- `--colocate_actor_ref`, `--ref_num_nodes 1`, `--ref_num_gpus_per_node 4`
+- 200 global steps (1600 gradient steps), save/eval every 10
+- Seed: 42
+
+**GPU allocation (8x H100 80GB)**:
+```
+GPUs 0-3: vLLM rollout — 4 engines × TP=1 (14B bf16 ~28GB + KV cache, fits)
+GPUs 4-7: Actor training (ZeRO-3) + co-located ref model
+```
+
+**Output paths**:
+```
+SAVE_PATH="/mnt/data/rft_output/qwen2.5-14b-grpo-q01"
+CKPT_PATH="/mnt/data/rft_checkpoints/qwen2.5-14b-grpo-q01"
+METRICS_LOG_DIR="/mnt/scratch/rft_metrics_qwen14b_q01"
+SAMPLES_LOG_DIR="/mnt/scratch/rft_samples_qwen14b_q01"
+```
+
+**Step count** (verified by preflight_lr.sh):
+```
+gradient_steps = 3200 * 8 / 16 * 1 = 1600
+grad_per_global = 8 * 16 / 16 = 8
+global_steps = 1600 / 8 = 200
+warmup: 80 gradient steps (~10 global steps)
+```
+
+#### Guardrails Checklist
+
+Six guardrails (G0–G5 + G6) organized into three execution phases:
+
+**Phase A — Pre-training (must pass before training starts)**:
+
+| Gate | Name | Method | PASS Criteria |
+|------|------|--------|---------------|
+| G0 | Prompt/Chat-Template Parity | Tokenize 5 samples via train path (HF `apply_chat_template`) vs eval path (vLLM chat API). Compare `input_ids`. | All 5 samples: exact `input_ids` match |
+| G2 | Parser/Reward Ceiling | Run baseline qwen14b on 200 OOD with BOXED_SUFFIX through chat template | boxed ≥ 98%, fail = 0%, length ≤ 5% |
+| G4 | Pass@k Headroom | Sample k=8 (temp=0.6) on ~330 problems where greedy@1 is wrong | pass@8 ≥ 15% (GRPO has signal) |
+
+**Phase B — Smoke run (first 10 global steps)**:
+
+| Gate | Name | Method | PASS Criteria |
+|------|------|--------|---------------|
+| G3 | vLLM Memory/Throughput | Watch for OOM, engine restarts, step time blow-up | No crashes, stable step time |
+| G5 | Runtime Assertions | Check metrics at step 10: LR, reward mean, grad_norm | LR ≈ 100% target; reward neither ~0 nor ~1 |
+| G1 | Pipeline Integrity | Compare in-training eval vs post-hoc eval on same step-10 checkpoint + OOD-202 | 0 discordants (exact match) |
+
+**Phase C — Post-training evaluation**:
+
+| Gate | Name | Method | PASS Criteria |
+|------|------|--------|---------------|
+| G6 | Paired McNemar Test | Eval K=3 checkpoints (step 100, 200, best-by-monitor) on OOD-1000. Paired comparison vs noRL baseline. | Gate-1b: Δ≥+3pp, p<0.05 → win. Gate-1a: Δ≥+2pp, p<0.10 → second seed. |
+
+#### Execution Order
+
+```
+Phase A:
+  1. prepare_rl_data_qwen.py → sft_rl_pool_3200_boxed.jsonl + probe_set_200_ood_boxed.jsonl (with SHA256)
+  2. verify_prompt_parity.py → G0 PASS/FAIL
+  3. eval_model_sweep.py --limit 200 → G2 PASS/FAIL
+  4. eval_passk_headroom.py → G4 go/no-go
+
+Phase B:
+  5. apply_patches.sh
+  6. preflight_lr.sh
+  7. train_grpo_qwen14b_q01.sh (first 10 steps) → G3 + G5
+  8. Pipeline integrity check (step 10 checkpoint) → G1
+
+Phase C:
+  9. Full training (200 steps)
+  10. Post-hoc eval (K=3 checkpoints, OOD-1000) → G6
+```
+
+#### Recovery After Crash
+
+If machine crashes during training:
+1. Check latest checkpoint in `/mnt/data/rft_checkpoints/qwen2.5-14b-grpo-q01/`
+2. Resume with `bash train_grpo_qwen14b_q01.sh --load_checkpoint <path>`
+3. If no checkpoint survived: re-run from Phase B step 5
+4. If crash during Phase A: re-run from step 1 (data files in `data/` are git-tracked)
+
+#### Scripts Created for Q1
+
+| Script | Purpose |
+|--------|---------|
+| `prepare_rl_data_qwen.py` | Append BOXED_SUFFIX to training pool + eval set, compute SHA256 |
+| `verify_prompt_parity.py` | G0: tokenized prompt parity between train and eval paths |
+| `eval_passk_headroom.py` | G4: pass@8 on wrong problems (go/no-go gate) |
+| `train_grpo_qwen14b_q01.sh` | Training launch script (adapted from A30) |
+
 ---
 
 ## 12. Consolidated Lessons

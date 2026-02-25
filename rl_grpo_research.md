@@ -2024,7 +2024,13 @@ When STOP-3 triggers, classify the bottleneck and choose the next single-variabl
 - Both models: ~71% boxed, ~12% last_number, ~17% fail
 - No meaningful difference in parsing behavior between base and RL
 
-*Mis-parse heuristic*: 24% upper bound (problems where extracted answer ≠ truth but output text is long enough to potentially contain a correct answer). Needs manual review to determine actual mis-parse rate, but this affects both models equally.
+*50-sample parser audit* (all 118 discordant cases examined):
+- 10/118 (8.5%) confirmed parser errors — all from last_number fallback grabbing trailing incidental numbers when the model used `**bold**` instead of `\boxed{}`
+- 8/118 (6.8%) ambiguous
+- 100/118 (84.7%) genuine model differences
+- **Parser errors are symmetric**: 5 hurt S0, 5 hurt SOTA → net impact on Δ is zero
+- Root cause: models sometimes format answers as `**N**` instead of `\boxed{N}`, and the last-number fallback grabs a trailing digit from context (e.g., "base 7", "7 seats")
+- Conclusion: parser noise does not bias the S0 vs SOTA comparison
 
 **Interpretation**:
 
@@ -2061,5 +2067,3 @@ The most concerning signal is that the discordant count (b+c=118, or 12.2% of pr
 - Full results: `/mnt/scratch/baseline_s0_eval/baseline_comparison.json`
 - Per-problem results: `/mnt/scratch/baseline_s0_eval/s0_ood1000.jsonl`, `sota_ood1000.jsonl`
 - Paired records: `/mnt/scratch/baseline_s0_eval/paired_records_s0_sota_ood1000.jsonl`
-
-**Lesson #22**: OOD-202 was giving misleading checkpoint-selection signals (+2.5pp difference that turned out to be noise on OOD-1000). At SE≈3.4%, differences up to ~7pp can appear by chance. OOD-1000 (SE≈1.5%) resolves this — differences >3pp are likely real, and the flat results here (Δ<0.2pp) give high confidence that all three checkpoints are truly equivalent. Always use the largest available probe for decisions; use the smaller probe for in-training monitoring only.

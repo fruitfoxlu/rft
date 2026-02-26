@@ -2470,3 +2470,264 @@ All lessons from §11 in one numbered list, grouped by category, with back-refer
 **#13** (§11.11, A26–A27): Understand `num_episodes` before launching. In OpenRLHF, `total_steps = len(prompts) * n_samples_per_prompt // train_batch_size * num_episodes * max_epochs`. With 50K prompts and num_episodes=5, this yields 125,000 steps — not ~40. Always compute `max_steps` before launching and verify the LR schedule reaches meaningful values within your intended step budget.
 
 **#14** (§11.11, A28): `max_steps` counts gradient steps, not global steps. Each global step contains `n_samples_per_prompt * rollout_batch_size / train_batch_size` gradient steps. For N global steps, you need `pool_size = N * rollout_batch_size` with `num_episodes=1`.
+
+## 13. RL Training Strategy Guide
+
+A practitioner-oriented reference distilled from 30+ attempts and hundreds of GPU-hours. Read this before designing a new RL experiment.
+
+### 13.1 Evaluation Strategy
+
+#### Why OOD eval, not k-fold cross-validation
+
+In supervised learning, k-fold is standard because the training objective (minimize loss on the data) is the same as the eval objective (predict well on held-out data from the same distribution). In RL fine-tuning, the goal is different: we want the model to **generalize** its improved reasoning to problems it has never seen, not just memorize the training pool. A k-fold split from NuminaMath would only tell us if the model is memorizing NuminaMath-style problems — it would not tell us if reasoning ability transferred.
+
+OOD evaluation (problems from a completely different source) directly measures what we care about: **did RL make the model a better reasoner, or did it just overfit the training distribution?**
+
+In our experiments, this distinction was critical. Training reward curves went up, in-distribution accuracy looked promising, but OOD-1000 showed zero improvement (§11.26). A k-fold test set from the same NuminaMath pool would likely have shown a false positive.
+
+#### How to size your eval sets
+
+The standard error (SE) of an accuracy estimate determines how much noise is in your measurement:
+
+```
+SE = sqrt(p × (1 - p) / N)
+```
+
+where `p` is the accuracy and `N` is the number of problems. At p ≈ 0.65:
+
+| Eval set size | SE | 95% CI (±) | Can detect |
+|---------------|-----|-----------|------------|
+| 18 (AIME) | ±11.2% | ±22pp | Nothing useful |
+| 200 | ±3.4% | ±6.7pp | Large effects only (≥7pp) |
+| 500 | ±2.1% | ±4.2pp | Medium effects (≥4pp) |
+| 1,000 | ±1.5% | ±3.0pp | Small effects (≥3pp) |
+| 5,000 | ±0.7% | ±1.3pp | Fine-grained comparison |
+
+**Rule of thumb**: your eval set should be large enough that the detectable effect size (2 × 95% CI) is smaller than the improvement you expect from RL. If you expect +3pp from RL, you need N ≥ 1,000. If you expect +10pp, N = 200 is sufficient.
+
+**Use multiple eval sets for different purposes**:
+
+| Role | Our set | Size | What it tells you |
+|------|---------|------|-------------------|
+| **Primary decision metric** | OOD-1000 | 1,000 | Did the model actually improve? (low noise) |
+| **In-training monitor** | OOD-200 | 202 | Is training heading in the right direction? (noisier but fast) |
+| **Overfitting detector** | ID-200 | 200 | Is the model memorizing training problems? |
+| **Sanity check** | AIME-18 | 18 | Smoke test only — never make decisions on this |
+
+#### Statistical testing
+
+Raw accuracy differences are not enough. Always compute:
+- **McNemar's test** (paired, per-problem): tests whether the discordant pairs (baseline-right/new-wrong vs baseline-wrong/new-right) are significantly different
+- **Discordant counts** (b, c): how many problems flipped in each direction
+- Optionally: **paired bootstrap 95% CI** for the accuracy difference
+
+A Δ of +2pp with McNemar p = 0.78 means nothing happened (§11.26). A Δ of +3pp with p < 0.05 is a real signal (§11.24 Gate-1b).
+
+### 13.2 Data Strategy
+
+#### How much training data?
+
+There is no universal answer — it depends on the interaction between pool size, number of epochs, and RL dynamics. Here is what we know:
+
+| Pool size | Epochs | Global steps | Outcome | Reference |
+|-----------|--------|-------------|---------|-----------|
+| 72 (AIME only) | 50 | ~3,600 grad steps | Severe overfitting, no generalization | §11.1 |
+| 400 | 1 | 25 global steps | Too few steps for meaningful learning | §11.11, A28 |
+| 3,200 | 1 | 200 global steps | Current standard; each problem seen once | §11.14, A29–A30 |
+| 50,000 | 5 | 125,000 grad steps | Misconfigured; training never left warmup | §11.11, A27 |
+
+**Current recipe**: 3,200 problems × 1 epoch = 200 global steps. Each problem seen exactly once. This avoids memorization risk from repeated exposure.
+
+**Key principle**: with `num_episodes=1`, pool size directly controls training duration. Doubling the pool from 3,200 to 6,400 doubles the number of global steps (200 → 400). This conflates two variables (data diversity and training length), so if you change pool size, keep other hyperparameters fixed and compare against the same-size baseline (Lesson #22, §11.24 STOP-3b).
+
+#### Signals that you need more data
+
+1. **Training reward saturates early**: if the model solves >90% of training problems within the first 50 steps, the reward signal becomes too sparse. More (harder) problems would provide more learning opportunities.
+
+2. **pass@k headroom is low on training data**: generate k=8 samples per problem. If the model already solves most training problems at least once out of 8 tries, RL has little room to push greedy accuracy higher. You need harder problems.
+
+3. **ID accuracy improves but OOD doesn't**: the model is memorizing the training distribution. More diverse problems (different sources, difficulty levels) may help OOD transfer.
+
+4. **Discordant analysis shows no pattern**: if RL is changing which problems the model gets right but the net effect is zero (equal flips in both directions), the training signal is directionless. More data alone won't fix this — check headroom and reward signal first.
+
+#### Signals that data is NOT the bottleneck
+
+1. **Model has low pass@k on wrong problems**: if pass@8 ≈ 0% on problems the model gets wrong at greedy, the model genuinely cannot solve them. More problems of the same difficulty won't help — you need an easier set or a more capable base model.
+
+2. **RL dynamics are broken**: gradient spikes, KL explosion, reward hacking. Fix the algorithm before scaling data.
+
+3. **Insufficient error headroom in the base model**: if the base model is already at 80%+ accuracy, only 20% of problems provide reward signal. Switching to a weaker base model (more headroom) is more effective than adding data (§11.27).
+
+#### Where to get more data
+
+In order of effort:
+
+1. **Existing pool** (zero effort): we use 3,200 out of 50,000 already-prepared NuminaMath problems. Scale to 6,400, 12,800, or 50,000 by changing the reservoir sample size.
+
+2. **Relax NuminaMath filters** (low effort): currently filtered to `question_type=math-word-problem` and integer answers only. Relaxing these filters yields more candidates from the same source.
+
+3. **Add MATH Level 1–3** (low effort): currently only Level 4–5 is used. Adding easier problems may help if the model needs more "warmup" problems to learn from.
+
+4. **Other HuggingFace datasets** (medium effort): GSM8K (~7.5k), MATH full (~12.5k), competition datasets. Requires adapting the data pipeline for different formats.
+
+5. **Synthetic data from a teacher** (high effort): use Gemini or a stronger model to generate new problems. Highest diversity but requires quality filtering.
+
+### 13.3 Base Model Selection
+
+The base model's accuracy on the eval set determines how much RL can potentially improve it. This is the **error headroom** — the fraction of problems the model gets wrong.
+
+```
+error_headroom = 1 - baseline_accuracy
+```
+
+| Base model | OOD-1000 | Error headroom | Outcome |
+|------------|----------|----------------|---------|
+| gpt-oss-20b (with suffix) | 83.5% | 16.5% | RL showed zero improvement (§11.26) |
+| qwen2.5-14b | 67.0% | 33.0% | Current target — 2× more headroom |
+| llama3.1-8b | 49.0% | 51.0% | Too weak — may lack capability to learn |
+
+**Sweet spot**: 60–70% baseline accuracy. Enough headroom for RL to work, but the model is capable enough to actually solve problems with RL guidance.
+
+**Checklist before selecting a base model**:
+
+1. **OOD accuracy in 60–70% range** — enough problems wrong to provide reward signal
+2. **High parse rate** (boxed ≥ 98%, fail = 0%) — clean EM reward, no noise from formatting
+3. **Low truncation** (finish_reason=length < 5%) — model can express full solutions
+4. **pass@8 headroom ≥ 15%** on wrong problems — model CAN solve some wrong problems with sampling, so RL has something to reinforce
+5. **Smaller model preferred** — faster RL iterations, lower GPU cost, all else equal
+
+### 13.4 When Results Are Bad: Decision Tree
+
+After an RL run completes, evaluate on OOD-1000 with McNemar test vs Baseline-S0:
+
+```
+OOD-1000 Δ vs Baseline-S0?
+│
+├─ Δ ≥ +3pp, p < 0.05 ──────────────► SUCCESS (Gate-1b). Replicate with different seed.
+│
+├─ +1pp ≤ Δ < +3pp, ambiguous p ────► GRAY ZONE. Increase eval set or run 2nd seed.
+│
+├─ -1pp < Δ < +1pp, p > 0.10 ──────► NO EFFECT. Diagnose:
+│   │
+│   ├─ Check pass@k on training data:
+│   │   ├─ pass@8 ≈ 0% on wrong problems ──► Headroom problem. Try weaker base model.
+│   │   └─ pass@8 > 0% on wrong problems ──► RL dynamics problem. Check below.
+│   │
+│   ├─ Check training reward curve:
+│   │   ├─ Reward flat ──────────────────────► LR too low, or KL too high, or LoRA too small.
+│   │   ├─ Reward ↑ but OOD flat ────────────► Overfitting. Try more diverse data or regularization.
+│   │   └─ Reward ↑ then ↓ ──────────────────► Training too long. Use earlier checkpoint.
+│   │
+│   ├─ Check discordant analysis:
+│   │   ├─ b ≈ c (equal flips) ──────────────► Directionless signal. Change data or reward.
+│   │   └─ b >> c (more regressions) ────────► RL is hurting. Reduce LR, increase KL.
+│   │
+│   └─ Change ONE variable and rerun:
+│       Priority order: (1) base model, (2) pool size/diversity,
+│       (3) LR/KL/clip, (4) LoRA rank/targets, (5) reward function
+│
+└─ Δ < -3pp ────────────────────────► REGRESSION. RL is harmful. Stop and diagnose.
+    Check: gradient spikes, KL explosion, LoRA capacity, reward hacking.
+```
+
+**Critical rule**: change ONE variable per run (§12, Lesson #22). If you change both pool size and LR simultaneously, you cannot attribute the result to either change.
+
+### 13.5 Hyperparameter Quick Reference
+
+Proven defaults from A29–A30 (200 global steps, binary EM reward, LoRA GRPO):
+
+| Parameter | Value | Why | When to change |
+|-----------|-------|-----|----------------|
+| `eps_clip` | 0.1 | Half the default; prevents late-run gradient spikes (Lesson #15) | Increase to 0.2 if learning is too slow |
+| `init_kl_coef` | 0.001 | Near-zero KL penalty; allows policy to move freely | Increase to 0.01–0.1 if policy drifts too far |
+| `n_samples_per_prompt` | 8 | Group size for GRPO advantage estimation | Increase to 16 for smoother gradients (2× cost) |
+| `lora_rank` | 32 | Moderate capacity; alpha=64 (scaling=2) | Increase to 64/128 if model isn't learning |
+| `lora_targets` | q,k,v,o_proj | Attention only | Add gate/up/down_proj if attention-only is insufficient |
+| `actor_learning_rate` | 5e-7 | Conservative; avoids instability | Increase to 1e-6 if reward is completely flat |
+| `lr_warmup_ratio` | 0.05 | ~10 global steps warmup | Don't change unless training length changes dramatically |
+| `micro_train_batch_size` | 2 | Better GPU utilization than 1 (Lesson #19) | Increase if GPU memory allows |
+| `generate_max_len` | 2048 | Sufficient for qwen2.5-14b (Lesson #25) | Increase if truncation > 5% |
+| `num_episodes` | 1 | Each problem seen once; avoids memorization | Increase only with very small pools (<500) |
+| `seed` | 42 | Reproducibility | Use different seed for replication runs |
+
+### 13.6 How to Tell if Training Data is Good or Bad
+
+Training data quality for RL is fundamentally different from supervised learning. In SFT, you need correct (input, output) pairs. In RL, you need problems where the model can **sometimes** succeed — the reward signal comes from the contrast between correct and incorrect rollouts within each group.
+
+#### The "learning zone" concept
+
+For each problem in the training pool, generate k=8 rollouts. The problem falls into one of three zones:
+
+| Zone | pass@8 | greedy@1 | RL signal | Action |
+|------|--------|----------|-----------|--------|
+| **Too easy** | 8/8 | correct | None — all rollouts succeed, advantage ≈ 0 | Remove or keep as stabilizer |
+| **Learning zone** | 1–7/8 | wrong or correct | Strong — GRPO has contrast between success/failure | This is what you want |
+| **Too hard** | 0/8 | wrong | None — all rollouts fail, advantage ≈ 0 | Remove or accept as padding |
+
+**Good training data** = a large fraction of problems in the learning zone.
+
+**Bad training data** = mostly too-easy or too-hard problems, where the model gets no useful gradient signal.
+
+#### Diagnostic: baseline solve rate on training pool
+
+Before launching RL, evaluate the base model on the training pool:
+
+| Metric | How to compute | Good range | Problem if outside |
+|--------|---------------|------------|-------------------|
+| greedy@1 accuracy | temp=0, n=1 on all training problems | 40–75% | >80% = too easy (sparse signal); <20% = too hard |
+| pass@8 on greedy-wrong | temp>0, n=8 on problems where greedy fails | ≥15% | <5% = model cannot solve these even with sampling; RL has nothing to reinforce |
+| Fraction in learning zone | % of problems with 1 ≤ pass@8 ≤ 7 | ≥30% | <15% = most problems are uninformative |
+
+Example from our experiments:
+- gpt-oss-20b on 3,200 NuminaMath problems: ~74% greedy@1 correct → only ~26% wrong → only a subset of those have pass@8 > 0 → very narrow learning zone → RL showed zero improvement
+- qwen2.5-14b on same problems: ~67% greedy@1 → 33% wrong → wider learning zone → more RL potential
+
+#### Red flags in training data
+
+1. **Mislabeled answers**: if the ground-truth label is wrong, the reward function punishes correct model outputs. Spot-check 50 random problems where the model's answer disagrees with the label — if the model is often right and the label wrong, you have a label quality problem.
+
+2. **Ambiguous problems**: problems with multiple valid interpretations or multiple correct integer answers. The EM reward will randomly reward/punish depending on which interpretation the model uses. Look for problems with high variance across rollouts where different rollouts give different-but-plausible answers.
+
+3. **Degenerate problems**: trivially short problems (<20 chars), problems that are just a number, problems with no mathematical content. The filtering pipeline (§11.3) removes most of these, but verify on a sample.
+
+4. **Distribution mismatch with eval**: if training problems are mostly arithmetic/algebra but OOD eval is geometry/combinatorics, RL improvements may not transfer. Compare the topic distribution of training vs eval:
+   - Training (NuminaMath): ~35% orca_math, ~28% synthetic_math, ~15% cn_k12, ~14% olympiads
+   - OOD eval (MATH 4-5): algebra, counting/probability, geometry, number theory, precalculus
+   - If there's a coverage gap (e.g., no geometry in training), improvements won't transfer to that topic.
+
+5. **Answer distribution skew**: if 50% of answers are "1" or "0", the model can get a high reward by always guessing these values. Check the answer distribution — it should be spread across many values. Our NuminaMath pool has 84% of answers in [0, 999] which is reasonable.
+
+6. **Too much synthetic data**: synthetic problems (orca_math, synthetic_math, metamath) make up ~66% of the NuminaMath pool. If these are formulaic or pattern-repetitive, the model may learn to exploit patterns rather than develop general reasoning. Monitor whether training improvements on synthetic problems transfer to real-exam problems.
+
+#### How to improve bad training data
+
+| Problem | Fix |
+|---------|-----|
+| Too easy (high greedy@1) | Use a weaker base model, or filter to only problems the model gets wrong at greedy |
+| Too hard (low pass@8) | Filter to problems where pass@8 ≥ 1, or add easier problems |
+| Mislabeled | Run a teacher model (Gemini) to verify labels; filter out disagreements |
+| Distribution mismatch | Add problems from sources that match the eval distribution |
+| Low diversity | Sample from more NuminaMath sources, or add external datasets |
+| Answer skew | Stratified sampling to balance answer values |
+
+#### Ongoing monitoring during RL
+
+Track these per-step metrics on the training batch to detect data issues early:
+
+- **Batch solve rate** (fraction of rollouts that are correct): should be 30–70%. If it creeps toward 90%+, the model has memorized the training pool. If it drops below 10%, problems are too hard.
+- **Advantage variance**: if advantages are near-zero for most problems, the data isn't providing contrast. This happens when all 8 rollouts for a problem give the same result (all correct or all wrong).
+- **Unique-answer diversity**: across 8 rollouts per problem, how many distinct answers appear? If always 1 (all same answer), the model is confident (right or wrong). If 4–8 distinct answers, the model is uncertain — these are the highest-signal problems.
+
+### 13.7 Pre-Flight Checklist
+
+Before launching any RL run:
+
+- [ ] **Baseline-S0 evaluated**: base model accuracy on OOD-1000 (no LoRA, same prompt, same eval pipeline)
+- [ ] **Error headroom ≥ 25%**: at least 250/1000 problems wrong at baseline
+- [ ] **Parse rate ≥ 98%**: boxed format compliance verified
+- [ ] **pass@k headroom checked**: pass@8 ≥ 15% on problems where greedy is wrong
+- [ ] **Step count verified**: `preflight_lr.sh` confirms global steps, warmup, and LR schedule
+- [ ] **Data SHA256 recorded**: training and eval data checksums logged for reproducibility
+- [ ] **Eval pipeline validated**: same eval code used for baseline and RL checkpoints
+- [ ] **One variable changed**: only one thing differs from the previous run
+- [ ] **K=3 checkpoints pre-registered**: final, mid, and best-by-monitor (§11.24 §3)

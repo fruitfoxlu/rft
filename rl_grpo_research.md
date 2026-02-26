@@ -2650,7 +2650,164 @@ Proven defaults from A29–A30 (200 global steps, binary EM reward, LoRA GRPO):
 | `num_episodes` | 1 | Each problem seen once; avoids memorization | Increase only with very small pools (<500) |
 | `seed` | 42 | Reproducibility | Use different seed for replication runs |
 
-### 13.6 How to Tell if Training Data is Good or Bad
+### 13.6 Hyperparameter Tuning Strategy
+
+The quick reference table above gives starting values. This section explains **what to observe** and **how to adjust** the four most impactful hyperparameters during RL training.
+
+#### Group size (`n_samples_per_prompt`)
+
+**What it controls**: how many rollouts per problem GRPO uses to estimate advantage. Larger groups → more reliable advantage estimates → smoother gradients, but at proportionally higher compute cost.
+
+**How it interacts with data**:
+- With binary EM reward (0 or 1), a group of 8 rollouts for one problem can only produce advantage signal if at least 1 rollout is correct AND at least 1 is wrong. If all 8 are correct (too easy) or all 8 are wrong (too hard), advantage = 0 for that problem.
+- Larger groups increase the chance that at least one rollout differs from the rest, so more problems contribute useful gradients.
+
+**How to diagnose**:
+- Track **fraction of groups with zero variance** (all same reward) per step. If >70% of groups have zero variance, the group size is too small OR the data is in the wrong difficulty range.
+- Track **advantage standard deviation**. If it's very high (>2.0), groups are noisy. If near zero, no learning signal.
+
+**Tuning guidance**:
+
+| Symptom | Group size action | Alternative |
+|---------|-------------------|-------------|
+| Most groups all-correct or all-wrong | Increase 8 → 16 | Better: fix data difficulty (§13.6) |
+| Noisy training curves, high step-to-step variance | Increase 8 → 16 | Or increase `train_batch_size` |
+| Training is too slow (wall-clock) | Decrease 16 → 8 | Accept noisier gradients |
+| Compute budget is tight | Keep at 8 | Minimum viable; 4 is too noisy for binary reward |
+
+**Cost**: group size is the single biggest compute multiplier. Doubling from 8 → 16 doubles rollout generation time (the bottleneck in GRPO).
+
+#### KL penalty (`init_kl_coef`)
+
+**What it controls**: how strongly the loss penalizes the RL policy for drifting away from the base model. Higher KL coefficient → policy stays closer to the base model → safer but slower learning.
+
+**The tradeoff**:
+- **Too low** (0.0–0.0001): policy can drift far from base model. Risk of catastrophic forgetting or mode collapse. But allows maximum learning speed.
+- **Too high** (0.1–1.0): policy barely moves from base model. Safe but may prevent any learning within the step budget.
+- **Sweet spot** (0.001–0.01): allows meaningful policy updates while providing a soft guardrail against drift.
+
+**How to diagnose**:
+- Track **KL divergence** (approximate, from importance ratios) over training steps.
+- KL ≈ 0 through the entire run → coefficient is so low it's irrelevant (current setting with 0.001). This is fine for short runs (200 steps) but risky for long runs.
+- KL growing steadily to >0.1 → policy is drifting significantly. If OOD accuracy is also improving, this is acceptable. If OOD is flat or declining, increase KL coefficient.
+- KL spikes → instability. Increase KL coefficient or reduce LR.
+
+**Tuning guidance**:
+
+| Symptom | KL action | Notes |
+|---------|-----------|-------|
+| OOD accuracy declining while reward increases | Increase 0.001 → 0.01 | Policy is drifting into reward-hacking territory |
+| KL stays at ~0, learning seems flat | KL is not the issue | Check LR, data, LoRA capacity instead |
+| Policy collapse (response length drops, entropy drops) | Increase to 0.01–0.1 | Strong regularization needed |
+| RL is working, OOD improving, KL is moderate | Leave as-is | Don't fix what isn't broken |
+
+**Interaction with `eps_clip`**: both constrain how much the policy can change per step. KL is a soft penalty (in the loss), eps_clip is a hard constraint (clips the importance ratio). They're complementary — typically set one tight and one loose.
+
+#### Clipping (`eps_clip`)
+
+**What it controls**: the maximum allowed importance ratio deviation per token. With `eps_clip=0.1`, the ratio `π_new(a|s) / π_old(a|s)` is clipped to [0.9, 1.1]. This prevents any single token from causing a massive policy update.
+
+**Why we use 0.1 instead of the default 0.2**:
+- With binary EM reward and LoRA, individual extreme-ratio tokens dominate the per-micro-batch gradient (Lesson #15)
+- `eps_clip=0.2` allowed late-run gradient spikes in A29A; `eps_clip=0.1` eliminated them in A29B with no loss in generalization
+- For small `micro_train_batch_size` (1–2), tighter clipping is especially important because there are fewer samples to average out outliers
+
+**How to diagnose**:
+- Track **ratio_max** and **ratio_p99** per step. If ratio_max is consistently at the clip boundary (1.1), clipping is active and constraining learning.
+- Track **pre-clipping grad_norm**. Spikes in grad_norm that are immediately followed by normal post-clipping grad_norm mean clipping is doing its job. But escalating spike magnitude over training suggests the policy is trying to make increasingly large updates.
+- Track **ppo_clip_ratio** (fraction of tokens being clipped). If >50%, the policy wants to update faster than clipping allows → consider loosening clip or reducing LR.
+
+**Tuning guidance**:
+
+| Symptom | eps_clip action | Notes |
+|---------|-----------------|-------|
+| Late-run gradient spikes | Tighten 0.2 → 0.1 | Most effective fix (Lesson #15) |
+| Very high clip ratio (>50%) | Consider loosening 0.1 → 0.15 | Or reduce LR instead |
+| Learning is too slow, no spikes | Loosen 0.1 → 0.2 | Only if grad norms are stable |
+| Both spikes AND slow learning | Keep at 0.1, increase LR | Clipping protects stability; LR drives learning |
+
+#### Max generation length (`generate_max_len`)
+
+**What it controls**: the maximum number of tokens the model can generate per rollout. Directly impacts both solution quality (can the model finish its reasoning?) and compute cost (longer generations = slower rollouts).
+
+**The tradeoff**:
+- **Too short**: model gets truncated mid-solution → answer never produced → reward = 0 for a problem the model could have solved → false negative reward signal, wasted compute
+- **Too long**: model generates verbose reasoning → slower rollouts → higher compute cost, and the model may learn to "pad" responses without improving accuracy
+- **Right size**: model can complete 95%+ of solutions without truncation, but isn't wasting tokens on unnecessary verbosity
+
+**How to diagnose**:
+- Track **truncation rate** by `finish_reason=length` (NOT heuristic length checks — Lesson #25). This is the ground truth for whether the model is hitting the token limit.
+- If truncation > 5%, some problems are losing reward signal due to incomplete solutions.
+- If truncation < 1% AND average response length is far below max, the limit is generous and could be reduced to save compute.
+
+**Tuning guidance**:
+
+| Symptom | max_len action | Notes |
+|---------|----------------|-------|
+| Truncation > 5% | Increase (e.g., 2048 → 3072) | Model needs more room to reason |
+| Truncation < 1%, avg length << max | Decrease (e.g., 4096 → 2048) | Save compute; qwen2.5-14b lost nothing going 4096 → 2048 |
+| Truncation increases over training | Monitor — model may be learning longer outputs | If accuracy also improves, acceptable; if not, add length penalty |
+| Model outputs very short responses | Not a max_len issue | Check for mode collapse (entropy, response diversity) |
+
+**Model-specific calibration**: different models need different max_len. Always run a truncation sensitivity check (§11.29) on the base model before choosing. Generate 200 problems at your candidate max_len and the next-higher setting; if accuracy is the same, use the shorter one.
+
+#### Learning rate (`actor_learning_rate`)
+
+**What it controls**: how large each gradient update is. In RL, this is the most dangerous parameter — too high causes catastrophic policy collapse, too low wastes compute on imperceptible updates.
+
+**Why it's listed last in tuning order, not first**:
+
+Unlike supervised learning where LR is the first thing you tune (via LR finder / grid search), in RL the LR interacts with everything else. The same LR that's stable with `eps_clip=0.1` may cause spikes with `eps_clip=0.2`. The same LR that works with group_size=16 (smooth gradients) may be too aggressive with group_size=8 (noisy gradients). You need to stabilize the other parameters first so that when you change LR, you can cleanly attribute the effect.
+
+**The LR schedule matters as much as the peak LR**:
+
+With cosine decay and `lr_warmup_ratio=0.05`:
+- Warmup: first ~10 global steps ramp from 0 to peak LR
+- Peak: steps 10–50 are near peak LR — this is where most learning happens
+- Decay: steps 50–200 decay toward min_lr (10% of peak)
+- Late training (steps 150+) is at <25% of peak — almost no learning, just noise accumulation
+
+This means the **effective training window is ~40 global steps** (steps 10–50). If your best checkpoint is consistently at step 130+, the model needed more time at high LR. Consider increasing `min_lr` (e.g., 0.1× → 0.2× of peak) to keep late-training LR higher.
+
+**How to diagnose**:
+
+| Metric | What to look for |
+|--------|-----------------|
+| **Training reward** over steps | Should increase during warmup and peak LR, then plateau or gently decline during decay |
+| **Gradient norm** | Should be stable (not escalating). Spikes at peak LR indicate LR is too high |
+| **OOD-200 during training** | Should improve during peak LR window. If flat, LR may be too low. If drops, too high |
+| **Best checkpoint location** | If always at the final step → model is still learning, consider longer training or higher min_lr. If at step 10–30 → peak LR may be too high, causing degradation after |
+| **Correctness collapse** | Sudden drop to <15% correctness → LR shock (§4.2, steps 16–17). Immediately indicates LR is too high |
+
+**Tuning guidance**:
+
+| Symptom | LR action | Notes |
+|---------|-----------|-------|
+| Reward completely flat for 50+ steps | Increase 5e-7 → 1e-6 | Also check: is data providing signal? (§13.7) |
+| Gradient spikes at peak LR | Decrease 5e-7 → 3e-7 | Or tighten eps_clip first |
+| Correctness collapse mid-training | Halve LR | LR shock — catastrophic |
+| Best checkpoint is very early (step 20–30) | Decrease LR or increase KL | Model overshoots quickly then degrades |
+| Best checkpoint is at final step | Model is still learning | Increase pool size (more steps) or raise min_lr |
+| OOD improves during peak then degrades during decay | LR schedule is fine | Normal — just pick the right checkpoint |
+
+**What we've learned**:
+- 1e-6 caused LR shock on gpt-oss-120b: correctness collapsed to 9–14% at peak (§4.2)
+- 5e-7 was stable on gpt-oss-20b across A29–A30 (200 global steps)
+- Best checkpoint at step 130/200 suggests the effective learning window (steps 10–50) was fine but late training added noise. Raising min_lr could help (§11.24 §7, intervention D)
+
+**Never change LR by more than 2× at a time.** Go 5e-7 → 7e-7 → 1e-6, not 5e-7 → 2e-6.
+
+#### Tuning order
+
+When starting a new base model, tune in this order (each step validates the previous):
+
+1. **`generate_max_len`** — run truncation sensitivity check first. Wrong max_len corrupts all downstream results.
+2. **`eps_clip`** — start at 0.1. Only loosen if ppo_clip_ratio > 50% and grad norms are stable.
+3. **`n_samples_per_prompt`** — start at 8. Only increase if >70% of groups have zero advantage variance.
+4. **`init_kl_coef`** — start at 0.001. Only increase if OOD degrades while training reward improves.
+5. **`actor_learning_rate`** — the most sensitive parameter. Only change after all others are stable. Small increments (5e-7 → 7e-7 → 1e-6).
+
+### 13.7 How to Tell if Training Data is Good or Bad
 
 Training data quality for RL is fundamentally different from supervised learning. In SFT, you need correct (input, output) pairs. In RL, you need problems where the model can **sometimes** succeed — the reward signal comes from the contrast between correct and incorrect rollouts within each group.
 
@@ -2718,7 +2875,7 @@ Track these per-step metrics on the training batch to detect data issues early:
 - **Advantage variance**: if advantages are near-zero for most problems, the data isn't providing contrast. This happens when all 8 rollouts for a problem give the same result (all correct or all wrong).
 - **Unique-answer diversity**: across 8 rollouts per problem, how many distinct answers appear? If always 1 (all same answer), the model is confident (right or wrong). If 4–8 distinct answers, the model is uncertain — these are the highest-signal problems.
 
-### 13.7 Pre-Flight Checklist
+### 13.8 Pre-Flight Checklist
 
 Before launching any RL run:
 

@@ -2875,7 +2875,63 @@ Track these per-step metrics on the training batch to detect data issues early:
 - **Advantage variance**: if advantages are near-zero for most problems, the data isn't providing contrast. This happens when all 8 rollouts for a problem give the same result (all correct or all wrong).
 - **Unique-answer diversity**: across 8 rollouts per problem, how many distinct answers appear? If always 1 (all same answer), the model is confident (right or wrong). If 4–8 distinct answers, the model is uncertain — these are the highest-signal problems.
 
-### 13.8 Pre-Flight Checklist
+### 13.8 Parallel vs Sequential Experiments
+
+#### Can we run multiple RL experiments in parallel?
+
+**Current constraint: No.** Our hardware is a single node with 8× H100 GPUs. One RL training run consumes all 8 GPUs (4 for vLLM rollout, 4 for ZeRO-3 actor + colocated reference). There is no room to run a second experiment simultaneously.
+
+#### Should we, if we had the hardware?
+
+**It depends on the phase of exploration.** Parallel experiments are not always more efficient — they can waste compute if runs are not designed carefully.
+
+**When parallel IS worth it**:
+
+| Scenario | Why parallel helps | Example |
+|----------|-------------------|---------|
+| Seed replication | Two identical runs with different seeds confirm whether an effect is real or noise | Run seed=42 and seed=123 in parallel after Gate-1a passes |
+| Binary A/B on a single variable | Two runs that differ by exactly one parameter, everything else identical | eps_clip=0.1 vs eps_clip=0.2, same data/LR/model |
+| Base model comparison | Same recipe on two different models, to pick the better starting point | qwen2.5-14b vs qwen2.5-32b |
+
+**When parallel is WASTEFUL**:
+
+| Scenario | Why it wastes compute | What to do instead |
+|----------|----------------------|-------------------|
+| Exploring multiple variables at once | Can't attribute results — if Run A changes LR and Run B changes KL, you learn about two points but can't interpolate | Sequential: change one variable, observe, then decide the next |
+| Before baseline is established | Don't know what "good" looks like yet — both runs may be in a bad region | Run baseline first, then design experiments around it |
+| Before diagnosing the bottleneck | If the problem is data quality, no amount of hyperparameter sweep will help | Diagnose first (§13.4), then target the right variable |
+| Grid search over many parameters | 2^N runs for N parameters — exponential cost, most points are uninformative | Sequential: tune in priority order (§13.6), each run informs the next |
+
+#### How to maximize learning per GPU-hour (sequential strategy)
+
+Since we're limited to sequential runs, the goal is to **maximize information per run**:
+
+1. **Short probe runs first** (50–100 steps instead of 200). Enough to see if the training reward is moving in the right direction. If reward is flat at step 50, kill the run and diagnose — don't wait 200 steps to confirm failure.
+
+2. **Evaluate frequently** (every 10 steps). Each eval point is a data point. With 200 steps and eval every 10, you get 20 OOD-200 accuracy measurements — enough to see a trend even through noise.
+
+3. **Log everything**. Grad norms, ratio stats, KL, reward, correctness, clip ratios, response lengths. A well-instrumented run that fails teaches you more than a blind run that succeeds. Most of our lessons (§12) came from analyzing failed runs.
+
+4. **Pre-commit to decisions**. Before launching, write down: "If OOD-200 accuracy at step 100 is below X%, I will stop and try Y." This prevents post-hoc rationalization and wasted GPU-hours on runs that should have been killed early (§11.24, Experiment SOP).
+
+5. **Reuse baselines**. The Baseline-S0 evaluation is expensive but only needs to run once per base model. All subsequent RL runs compare against the same baseline.
+
+#### If we had 2 nodes (16 GPUs)
+
+The optimal strategy would be:
+
+- **Node 1**: Run the primary experiment (current best recipe + one variable changed)
+- **Node 2**: Run a seed replication of the previous best result, OR a diagnostic eval (pass@k headroom, data quality audit)
+
+This way, Node 2 is always doing **confirmation or diagnostic work** that informs the next experiment, rather than speculatively exploring a parameter that may not be the bottleneck.
+
+#### If we had 4+ nodes
+
+Then a small parallel sweep becomes viable. The most efficient design is a **1-D sweep on a single variable** (e.g., LR ∈ {3e-7, 5e-7, 7e-7, 1e-6}) with everything else held constant. This gives you a response curve for that variable in one wall-clock cycle, which would take 4 sequential runs otherwise.
+
+**Never** do a full grid search (e.g., 4 LRs × 3 KL values × 2 clip values = 24 runs). The interaction effects are small and the cost is prohibitive. Tune one variable at a time, in priority order.
+
+### 13.9 Pre-Flight Checklist
 
 Before launching any RL run:
 
@@ -2888,3 +2944,4 @@ Before launching any RL run:
 - [ ] **Eval pipeline validated**: same eval code used for baseline and RL checkpoints
 - [ ] **One variable changed**: only one thing differs from the previous run
 - [ ] **K=3 checkpoints pre-registered**: final, mid, and best-by-monitor (§11.24 §3)
+- [ ] **Decision criteria pre-committed**: write down stop/continue thresholds before launching

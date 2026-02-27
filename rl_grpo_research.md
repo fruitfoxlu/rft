@@ -8,13 +8,16 @@
 
 ## 0. Current State & Pivot History
 
-### Current Status (2026-02-25)
+### Current Status (2026-02-27)
 
-- **RL on gpt-oss-20b showed zero measurable effect** (§11.26): paired McNemar test on OOD-1000 gives Δ=−0.40pp, p=0.783, 95% CI [−2.5, +1.7]. The 118 discordant problems (61 regressions, 57 improvements) confirm RL changes outputs but without directional improvement.
-- **Pivoting to qwen2.5-14b** (§11.28): model sweep identified qwen2.5-14b at 67.0% OOD-1000 (33% headroom) with 99.2% boxed rate — near-perfect EM reward signal.
-- **Current recipe**: DR-GRPO, pure EM reward, eps_clip=0.1, micro_train_batch_size=2, LoRA r=32.
-- **Key baselines**: gpt-oss-20b 73.8% OOD-1000 (no suffix) / 83.5% (with suffix); qwen2.5-14b 67.0%.
-- **Next steps**: Stage 2 eval (ID-200, AIME-18) for qwen2.5-14b, then RL experiment with paired McNemar test.
+- **Q1 diagnostics complete (§11.32)**: Three diagnostics classify the null result as **DIRECTIONLESS / ALSO_NULL / ALSO_FLAT**.
+  - D1: Policy moved (23.5% answers changed, b+c=83) but directionlessly — improvements cancel regressions.
+  - D2: ID-heldout also null (Δ=−0.2pp) — not a distribution mismatch; RL doesn't help even on in-distribution data.
+  - D3: Pass@8 also flat (Δ=−0.5pp) — model capability unchanged, not just greedy mode selection.
+- **Diagnosis**: The policy produces different outputs but no better ones. The problem is **not** headroom, distribution, or greedy-vs-sampling. The RL signal (binary EM reward + DR-GRPO) fails to induce directional improvement at any level. This points to reward signal quality / credit assignment as the bottleneck.
+- **This is the second independent null result**: gpt-oss-20b (§11.26, Δ=−0.40pp) and qwen2.5-14b (§11.31, Δ=+0.70pp) both show DR-GRPO with pure EM reward produces no measurable improvement.
+- **Key baselines**: gpt-oss-20b 73.8% OOD-1000; qwen2.5-14b 67.0%.
+- **Next steps**: The diagnosis rules out several root causes. Focus should be on: (1) reward signal enrichment (process reward, soft correctness), (2) larger update magnitude (higher LR or full fine-tune), or (3) fundamentally different RL algorithm.
 - **SOP**: See §11.24 for experiment protocol. **Consolidated lessons**: See §12.
 
 ### Pivot 1: gpt-oss-120b → gpt-oss-20b (Phase 1 → Phase 2, A25 → A26)
@@ -2311,8 +2314,8 @@ More importantly, **max_tokens=2048 is not just viable — it's slightly better*
 | `--max_len` | 5120 | 3072 | prompt(1024) + gen(2048) |
 | `--prompt_data` | `sft_rl_pool_3200.jsonl` | `sft_rl_pool_3200_boxed.jsonl` | BOXED_SUFFIX appended |
 | `--eval_dataset` | `probe_set_200_ood.jsonl` | `probe_set_200_ood_boxed.jsonl` | BOXED_SUFFIX appended |
-| `--vllm_num_engines` | 2 | 4 | TP=1 → 4 engines |
-| `--vllm_tensor_parallel_size` | 2 | 1 | 14B bf16 (~28GB) fits 1 GPU |
+| `--vllm_num_engines` | 2 | 2 | Same as A30 (TP=1 crashed, see §11.31) |
+| `--vllm_tensor_parallel_size` | 2 | 2 | TP=1 + `--vllm_sync_with_ray` crashes (see §11.31) |
 
 **Unchanged** (proven across 30 experiments):
 - Algorithm: `dr_grpo`, `eps_clip=0.1`, `init_kl_coef=0.001`
@@ -2408,6 +2411,189 @@ If machine crashes during training:
 | `verify_prompt_parity.py` | G0: tokenized prompt parity between train and eval paths |
 | `eval_passk_headroom.py` | G4: pass@8 on wrong problems (go/no-go gate) |
 | `train_grpo_qwen14b_q01.sh` | Training launch script (adapted from A30) |
+
+### 11.31 Attempt Q1 Results: qwen2.5-14b EM-GRPO (Zero Effect, Again)
+
+**Date**: 2026-02-26
+
+#### Training Summary
+
+Training ran for 200/200 global steps (5h26m, ~97s/step). No crashes or instability throughout.
+
+**Bug fix during launch**: Initial config used TP=1 with 4 vLLM engines, but `--vllm_sync_with_ray` crashed because `ray.util.collective.init_collective_group()` requires a Ray actor context, which the uniproc executor (used at TP=1) doesn't provide. Fix: reverted to TP=2 with 2 engines (matching proven A30 config). Same 4-GPU allocation for vLLM.
+
+**Guardrails passed (Phase A)**:
+- G0: PASS — 5/5 prompt parity (Qwen2TokenizerFast)
+- G4: PASS — pass@8 = 49.4% (163/330 wrong problems solvable with 8 samples). Excellent headroom.
+
+**Guardrails passed (Phase B)**:
+- G3: PASS — no OOMs, stable step time (~97s), LoRA sync working (384 params, 100.7 MB/sync)
+- G5: PASS — LR at step 10 ≈ 95% of target (4.75e-7), reward 0.56–0.87 (learning zone), all metrics present
+
+#### In-Training Eval (OOD-202, greedy pass@1)
+
+| Step | pass@1 | Step | pass@1 |
+|------|--------|------|--------|
+| 10 | 57.4% | 110 | 58.4% |
+| 20 | 57.9% | 120 | 55.4% |
+| 30 | **59.4%** | 130 | 58.4% |
+| 40 | 58.4% | 140 | 55.0% |
+| 50 | 58.9% | 150 | 54.5% |
+| 60 | 57.4% | 160 | 55.4% |
+| 70 | 57.4% | 170 | 58.5% |
+| 80 | **59.4%** | 180 | 58.4% |
+| 90 | 55.9% | 190 | 56.4% |
+| 100 | 55.9% | 200 | 58.4% |
+
+**Eval trajectory**: Flat throughout training, oscillating 54.5–59.4%. No sustained improvement trend. Best-by-monitor (trailing 3-eval avg): step 50 (58.9%).
+
+#### G6 Post-Hoc Evaluation (OOD-1000, greedy, BOXED_SUFFIX)
+
+| Model | Accuracy | Δ vs baseline |
+|-------|----------|--------------|
+| Baseline (no RL) | 67.0% (670/1000) | — |
+| Step 50 (best-monitor) | 66.8% (668/1000) | −0.2pp |
+| Step 100 (mid) | **67.7%** (677/1000) | **+0.7pp** |
+| Step 200 (final) | 67.2% (672/1000) | +0.2pp |
+
+#### Paired Statistics (best checkpoint: step 100)
+
+| Metric | Value |
+|--------|-------|
+| N paired | 1000 |
+| Δ (RL − baseline) | +0.70pp |
+| Discordants | b=38 (base✓, RL✗), c=45 (base✗, RL✓) |
+| Net improvement | c − b = +7 problems |
+| McNemar p-value | 0.510 |
+| Bootstrap 95% CI | [−1.1pp, +2.5pp] |
+
+**Gate decisions**: Neither Gate-1b (Δ≥+3pp, p<0.05) nor Gate-1a (Δ≥+2pp, p<0.10) passes.
+
+#### Verdict
+
+**RL (DR-GRPO with pure EM reward) again shows zero measurable effect**, now on a model with abundant headroom (33% error zone, 49.4% pass@8). This is the second independent test (after gpt-oss-20b in §11.26) showing the same result.
+
+**Key observations**:
+1. The model had plenty of headroom: 330 problems wrong at baseline, 163 solvable with sampling. GRPO had ample "learnable" problems to exploit.
+2. Training was stable: reward ~0.6–0.9, no grad_norm spikes, no entropy collapse, no ratio blow-up. The training loop ran correctly.
+3. But the RL signal did not translate into systematic OOD improvement. The 83 discordant problems at step 100 (38 regressions + 45 improvements) are well within noise.
+4. The in-training OOD-202 eval was flat from step 10 to step 200, confirming the model learned nothing generalizable.
+
+**Possible root causes to investigate**:
+- Binary EM reward is too sparse/noisy for GRPO to exploit effectively
+- LoRA rank=32 on q/k/v/o may not have enough capacity for non-trivial reasoning improvements
+- 3200-problem pool may not provide enough diversity for OOD generalization
+- The cosine LR schedule may peak too early (step ~10) and decay through most of training
+- Need outcome-supervised or process-supervised reward instead of binary EM
+
+#### Files & Artifacts
+
+| Artifact | Path |
+|----------|------|
+| Training script | `train_grpo_qwen14b_q01.sh` |
+| Training log | `/mnt/scratch/rft_metrics_qwen14b_q01/train_q01.log` |
+| Training metrics | `/mnt/scratch/rft_metrics_qwen14b_q01/training_metrics.jsonl` |
+| Checkpoints | `/mnt/data/rft_checkpoints/qwen14b-grpo-q01/global_step{10..200}_hf` |
+| Merged models | `/mnt/scratch/merged_models_qwen14b_q01/{step50,step100,step200}` |
+| G6 eval results | `/mnt/scratch/qwen14b_q01_eval/g6_summary.json` |
+| Per-problem JSONL | `/mnt/scratch/qwen14b_q01_eval/{step50,step100,step200}_ood1000.jsonl` |
+| Paired records | `/mnt/scratch/qwen14b_q01_eval/paired_*_vs_baseline_ood1000.jsonl` |
+| G6 eval script | `eval_g6_qwen14b_q01.py` |
+
+---
+
+### 11.32 Q1 Diagnostics: Why GRPO Shows Null Effect
+
+**Date**: 2026-02-27
+
+Three diagnostics to classify why the Q1 null result occurred. All eval files re-run with unified schema `{problem_hash, correct, truth, model_answer, output, parse_method, finish_reason, source}` (Phase 0). Re-eval accuracy matched original G6 numbers exactly (deterministic greedy confirmed).
+
+#### D1: Did the policy actually move?
+
+Compares baseline vs step100 on OOD-1000.
+
+| Metric | Value |
+|--------|-------|
+| Both correct | 632 |
+| Both wrong | 285 |
+| b (base✓ RL✗) | 38 |
+| c (base✗ RL✓) | 45 |
+| b+c (discordant) | 83 (8.3%) |
+| **Answers changed** | **235/1000 (23.5%)** |
+| Δ | +0.70pp, p=0.510 |
+
+**Policy shift metrics (final 10 steps)**: KL ≈ −0.0001 (near zero), ppo_kl ≈ −0.00002, ratio_max ≈ 1.245, log_ratio_abs_p99 ≈ 0.145. Reward: first 10 mean 0.683 → last 10 mean 0.705.
+
+**Interpretation: DIRECTIONLESS** — b+c=83 (8.3%) is well above "too small" threshold, meaning the policy IS producing different outputs. But improvements and regressions cancel out almost exactly. The 235 changed answers (23.5%) confirm substantial output variation, but the net effect is noise. This suggests objective/data mismatch, not LR/rank issue.
+
+#### D2: Does it help ID but not OOD?
+
+Evaluates baseline vs step100 on ID-heldout-1000 (from same NuminaMath distribution as training pool, disjoint from both training 3200 and OOD-1000).
+
+| Metric | Value |
+|--------|-------|
+| Baseline ID-heldout | 70.1% (701/1000) |
+| Step100 ID-heldout | 69.9% (699/1000) |
+| Δ | −0.20pp, p=0.888 |
+| b+c (discordant) | 50 (5.0%) |
+| 95% CI | [−1.6pp, +1.2pp] |
+
+**Interpretation: ALSO_NULL** — The RL checkpoint doesn't improve on in-distribution data either. This rules out the "trained on ID but doesn't transfer to OOD" hypothesis. The problem is more fundamental: RL dynamics / credit assignment / update magnitude.
+
+Note: ID-heldout b+c=50 (5.0%) vs OOD b+c=83 (8.3%) — fewer discordant problems on ID, suggesting even less policy movement on familiar data.
+
+#### D3: Pass@k improved but greedy didn't?
+
+Evaluates pass@8 on 200 problems where baseline greedy was wrong.
+
+| Metric | Baseline | Step100 |
+|--------|----------|---------|
+| pass@8 | 49.5% (99/200) | 49.0% (98/200) |
+| Per-sample acc | 21.4% | 20.4% |
+| Δ pass@8 | −0.5pp, p=1.000 |
+| b+c (discordant) | 33 (16.5%) |
+
+**Interpretation: ALSO_FLAT** — Pass@8 is unchanged, ruling out the hypothesis that RL improved stochastic capability but not greedy selection. Model capability is genuinely unchanged at both greedy and sampling levels.
+
+#### Combined Diagnosis
+
+| Diagnostic | Result | Rules Out |
+|------------|--------|-----------|
+| D1 | DIRECTIONLESS | LR too low, LoRA too small |
+| D2 | ALSO_NULL | Distribution mismatch (ID vs OOD) |
+| D3 | ALSO_FLAT | Greedy vs sampling mode difference |
+
+**Root cause**: The policy DOES change outputs (23.5% of answers differ) but the changes are random — equal chance of improving or regressing any given problem. Binary EM reward + DR-GRPO produces undirected exploration, not directed improvement. The reward signal is insufficient for credit assignment at the reasoning-step level.
+
+**What's NOT the problem**:
+- Not headroom (49.4% pass@8, 330 wrong problems)
+- Not training instability (smooth reward, KL, ratios throughout)
+- Not distribution mismatch (null on both ID and OOD)
+- Not LR/rank too small (policy changes 23.5% of answers)
+- Not greedy-vs-sampling (pass@8 also flat)
+
+**What's left**:
+1. Binary EM reward provides no signal about WHICH tokens in a reasoning chain are valuable. GRPO can only learn "this entire response worked / didn't work."
+2. With n=8 samples, most problems produce all-correct or all-wrong rollouts (reward variance = 0). Only problems in the ~50% zone provide gradient signal, but their corrections are offset by equal-magnitude regressions elsewhere.
+3. The eps_clip=0.1 constraint may be preventing large enough updates to escape the current policy basin.
+
+#### Files & Artifacts
+
+| Artifact | Path |
+|----------|------|
+| Diagnostics script | `run_q1_diagnostics.py` |
+| D1 summary | `/mnt/scratch/qwen14b_q01_eval/diag/d1_movement_summary.json` |
+| D1 policy shift | `/mnt/scratch/qwen14b_q01_eval/diag/d1_policy_shift_metrics.json` |
+| D1 paired records | `/mnt/scratch/qwen14b_q01_eval/diag/paired_records_ood1000_baseline_vs_step100.jsonl` |
+| D2 summary | `/mnt/scratch/qwen14b_q01_eval/diag/d2_idheldout_summary.json` |
+| D2 baseline results | `/mnt/scratch/qwen14b_q01_eval/diag/d2_baseline_idheldout.jsonl` |
+| D2 step100 results | `/mnt/scratch/qwen14b_q01_eval/diag/d2_step100_idheldout.jsonl` |
+| D3 summary | `/mnt/scratch/qwen14b_q01_eval/diag/d3_pass8_summary.json` |
+| D3 paired pass@8 | `/mnt/scratch/qwen14b_q01_eval/diag/d3_paired_pass8_wrong200.jsonl` |
+| D3 step100 pass@8 | `/mnt/scratch/qwen14b_q01_eval/diag/d3_step100_pass8_wrong200.jsonl` |
+| ID-heldout data | `data/id_heldout_1000_boxed.jsonl` (SHA256: 01d14627) |
+| Wrong200 data | `data/ood1000_wrong200_boxed.jsonl` (SHA256: 704589ac) |
+| Full log | `/mnt/scratch/qwen14b_q01_eval/diag/diagnostics.log` |
 
 ---
 

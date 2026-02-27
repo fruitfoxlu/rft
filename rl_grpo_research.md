@@ -3131,3 +3131,297 @@ Before launching any RL run:
 - [ ] **One variable changed**: only one thing differs from the previous run
 - [ ] **K=3 checkpoints pre-registered**: final, mid, and best-by-monitor (§11.24 §3)
 - [ ] **Decision criteria pre-committed**: write down stop/continue thresholds before launching
+
+---
+
+## 14. Post-Q1 Experiment Plan: Three Tracks
+
+Following the Q1 diagnostic results (§11.32), we identified the root cause of null GRPO effect as **undirected policy exploration** — the model changes 23.5% of answers but improvements and regressions cancel out. Binary EM reward + DR-GRPO cannot provide directional credit assignment at the reasoning-step level.
+
+Three parallel tracks address this from different angles.
+
+### Diagnostic Context (What We Ruled Out)
+
+| Hypothesis | Diagnostic | Result | Status |
+|------------|-----------|--------|--------|
+| Update magnitude too small | D1: b+c, answer changed % | b+c=83 (8.3%), 23.5% answers changed | **Ruled out** |
+| Distribution mismatch (ID vs OOD) | D2: ID-heldout eval | ID Δ=−0.2pp, also null | **Ruled out** |
+| Greedy mode vs sampling capability | D3: pass@8 comparison | pass@8 Δ=−0.5pp, also flat | **Ruled out** |
+| Insufficient headroom | G4: pass@8 on wrong set | 49.4% (163/330 solvable) | **Ruled out** |
+| Training instability | G3/G5: metrics during training | Smooth throughout | **Ruled out** |
+
+**What remains**: The reward signal (binary EM) is too coarse for credit assignment. The model needs either (a) direct demonstration of correct reasoning (Track A), (b) better RL signal structure (Track B), or (c) step-level reward (Track C).
+
+---
+
+### Track A: Rejection Sampling Fine-Tuning (RSFT)
+
+**Hypothesis**: The model CAN produce correct solutions (pass@8=49.4% on wrong problems) but GRPO can't distill this into greedy mode. Directly SFT-ing on correct samples bypasses the credit assignment problem entirely.
+
+**Rationale**: RSFT is the simplest intervention and has strong empirical support (ReST, STaR, Self-Taught Reasoner). It converts the stochastic capability proven by D3's pass@8 into deterministic greedy performance. No reward model needed — binary EM filter is sufficient.
+
+#### Design
+
+```
+Phase 1: Sample
+  - Model: Qwen/Qwen2.5-14B-Instruct (baseline, no RL)
+  - Data: sft_rl_pool.jsonl (50k problems) or 10k subset for speed
+  - Sampling: k=16 per problem, temperature=0.6, max_tokens=2048
+  - BOXED_SUFFIX appended to each prompt
+
+Phase 2: Filter
+  - Grade each sample with binary EM (extract_model_answer + check_correctness)
+  - Keep only (prompt, correct_response) pairs where EM=1
+  - Deduplicate by (problem_hash, normalized_answer) to avoid trivial repeats
+  - Expected yield: ~30-50% of samples on learnable problems
+
+Phase 3: SFT
+  - Method: LoRA fine-tune on filtered correct samples
+  - Same LoRA config as Q1: rank=32, alpha=64, q/k/v/o_proj
+  - Standard cross-entropy loss
+  - Learning rate: 2e-5 (standard SFT LR, higher than RL)
+  - Epochs: 1-3 over the filtered dataset
+  - No KL penalty needed (SFT doesn't drift as aggressively as RL)
+
+Phase 4: Evaluate
+  - OOD-1000 greedy, same pipeline as G6
+  - Same decision gates: Gate-1b (Δ≥+3pp, p<0.05), Gate-1a (Δ≥+2pp, p<0.10)
+```
+
+#### Success Criteria
+
+- **Primary**: OOD-1000 Δ ≥ +2pp with p < 0.10 (Gate-1a)
+- **Secondary**: ID-heldout-1000 shows improvement (confirms learning happened)
+- **Failure mode to watch**: ID improves but OOD doesn't (overfitting to NuminaMath style)
+
+#### Estimated Time
+
+- Sampling: ~4-8 hours (50k × 16 samples)
+- Filtering: <1 hour (CPU)
+- SFT: ~2-4 hours (standard fine-tuning, much faster than RL)
+- Evaluation: ~1 hour
+- **Total: ~1-2 days**
+
+---
+
+### Track B: GRPO with Enriched Signal
+
+**Hypothesis**: The RL algorithm itself can work if we fix the structural issues: too few rollouts per group (variance=0 problem) and overly conservative clipping.
+
+**Rationale**: With n=8 and binary EM, most problem groups produce all-correct or all-wrong rollouts (reward variance=0 → zero gradient). Increasing group size gives more mixed-outcome groups. Relaxing eps_clip allows larger policy updates when gradient exists.
+
+#### Sub-experiments
+
+**B1: Larger group size (n=32)**
+```
+Changes from Q1:
+  - --n_samples_per_prompt 8 → 32
+  - --micro_rollout_batch_size: adjust for memory
+  - --vllm_num_engines: may need adjustment for throughput
+  - Everything else unchanged (same LR, eps_clip, LoRA config)
+
+Expected effect: 4x more rollouts → more groups with mixed outcomes →
+  more gradient signal. At n=32, a problem with p=0.5 has P(mixed)=99.99%
+  vs P(mixed)=99.2% at n=8. More importantly, problems with p=0.1 go
+  from P(mixed)=57% to P(mixed)=96%.
+
+Risk: 4x slower per step (more rollouts). May need to reduce step count
+  or problem count per batch.
+```
+
+**B2: Relaxed clipping (eps_clip=0.2 or unconstrained)**
+```
+Changes from Q1:
+  - --eps_clip 0.1 → 0.2 (or remove entirely)
+  - Everything else unchanged
+
+Expected effect: Allows larger policy updates when gradient signal
+  exists. D1 showed the policy IS moving but changes are small and
+  random — larger steps might help escape local basins.
+
+Risk: Training instability if updates too large. Monitor ratio_max
+  and KL carefully.
+```
+
+**B3: Combined B1+B2**
+```
+Both larger group size and relaxed clipping together.
+Only run after B1 and B2 individually to attribute effects.
+```
+
+#### Success Criteria
+
+Same as Track A: OOD-1000 Gate-1a or Gate-1b.
+
+#### Critical Rule
+
+Change ONE variable per run (§12, Lesson #22). Run B1 and B2 separately first. Only combine if individual results are informative.
+
+---
+
+### Track C: LLM-as-a-Judge Process Reward
+
+**Hypothesis**: Binary EM reward fails at credit assignment because it scores the entire response as 0 or 1. A step-level judge can provide gradient signal about WHICH reasoning steps are valuable, enabling directed policy improvement.
+
+**Rationale**: This directly addresses the core bottleneck identified by D1: the policy explores (23.5% of answers change) but changes are random. A process reward model (PRM) that scores reasoning quality would make improvements more likely to be rewarded than regressions. Instead of training a dedicated PRM, we use an LLM as judge — cheaper to implement and doesn't require PRM training data.
+
+#### Architecture
+
+```
+reward(response) = EM(response) + α × judge_score(response) × mask
+
+where:
+  - EM(response) ∈ {0, 1}: binary exact-match (existing reward)
+  - judge_score(response) ∈ [0, 1]: LLM judge's assessment of reasoning quality
+  - mask: depends on variant (C1 or C2)
+  - α: bonus weight (hyperparameter, e.g., 0.3-0.5)
+```
+
+#### Two Variants
+
+**C1: Judge bonus when EM=1 (quality differentiation among correct solutions)**
+
+```
+reward = EM + α × judge_score × EM
+       = EM × (1 + α × judge_score)
+
+When EM=1: reward = 1 + α × judge_score  (range: [1, 1+α])
+When EM=0: reward = 0                     (unchanged)
+```
+
+**What C1 does**: Differentiates correct solutions by reasoning quality. A correct answer with clean, logical reasoning gets reward ~1.5, while a correct answer that got lucky (wrong reasoning, right number) gets reward ~1.0. This teaches GRPO to prefer robust reasoning paths.
+
+**When C1 helps**: When the model frequently gets correct answers through flawed reasoning (e.g., arithmetic errors that cancel out). By preferring well-reasoned correct solutions, the model should become more consistent.
+
+**Limitation**: Doesn't address the zero-gradient problem on all-wrong groups. Problems where all 8 rollouts are wrong still produce no signal.
+
+---
+
+**C2: Judge bonus when EM=0 (partial credit for wrong solutions)**
+
+```
+reward = EM + α × judge_score × (1 - EM)
+
+When EM=1: reward = 1                     (unchanged)
+When EM=0: reward = α × judge_score       (range: [0, α])
+```
+
+**Critical invariant: max(EM=0 reward) < min(EM=1 reward)**
+
+We must ensure that the highest-rewarded wrong answer is ALWAYS below the lowest-rewarded correct answer. Otherwise, GRPO would learn to prefer well-reasoned wrong answers over correct ones — directly counterproductive.
+
+```
+max(EM=0 reward) = α × 1.0 = α
+min(EM=1 reward) = 1.0
+
+Invariant holds iff α < 1.0.
+
+With α=0.3: max wrong reward = 0.3, min correct reward = 1.0.  ✓ (gap = 0.7)
+With α=0.5: max wrong reward = 0.5, min correct reward = 1.0.  ✓ (gap = 0.5)
+
+If combined with C1 (EM=1 bonus): min correct reward = 1.0 + 0 = 1.0 (still holds).
+```
+
+Recommend starting with **α=0.3** to maintain a large gap (0.7) between the reward regimes. This ensures correctness is always strongly preferred, while still providing meaningful gradient signal on wrong answers.
+
+**What C2 does**: Gives partial credit to wrong answers based on reasoning quality. A solution that sets up the problem correctly, applies the right technique, but makes an arithmetic error in the last step gets reward ~0.25 instead of 0. This provides gradient signal on problems that currently produce zero gradient.
+
+**When C2 helps**: Directly addresses the core bottleneck. With n=8 rollouts, problems where all samples are wrong currently produce no gradient. C2 creates reward variance within these groups — better reasoning gets higher partial credit — enabling GRPO to improve even on hard problems.
+
+**Limitation**: Risk of reward hacking — the model could learn to produce outputs that score well with the judge without actually improving mathematical reasoning. The invariant (α < 1) ensures correctness always dominates, but judge quality still matters. Monitor for divergence between judge reward trend and EM accuracy trend.
+
+---
+
+#### Priority: C2 before C1
+
+**C2 is higher priority** because it directly addresses the identified bottleneck (zero gradient on all-wrong groups). D1 showed the policy moves but changes are random; C2 provides directional signal on exactly the problems where it's missing.
+
+C1 is complementary — run after C2 if C2 shows promise.
+
+#### Judge Design
+
+```
+Judge model: TBD (options: same Qwen2.5-14B, a separate model,
+             or external API like Claude)
+
+Judge prompt (draft):
+  "You are evaluating a student's mathematical reasoning.
+   Problem: {problem}
+   Student's solution: {response}
+   Correct answer: {ground_truth}
+
+   Score the reasoning quality from 0.0 to 1.0:
+   - 1.0: Perfect reasoning, correct approach, clear steps
+   - 0.7-0.9: Right approach, minor errors (arithmetic, sign, etc.)
+   - 0.4-0.6: Partially correct approach, significant errors
+   - 0.1-0.3: Wrong approach but shows some mathematical understanding
+   - 0.0: No meaningful reasoning or completely wrong approach
+
+   Output only the numeric score."
+
+Scoring: Extract float from judge response. Clamp to [0, 1].
+Cache: Judge scores can be cached per (problem_hash, response_hash)
+       since they don't change across training steps.
+```
+
+#### Implementation Considerations
+
+1. **Judge latency**: Judge scoring happens during rollout grading, adding latency per step. Options:
+   - Use a small/fast judge model (e.g., Qwen2.5-7B) served on separate GPUs
+   - Batch judge requests
+   - Cache scores across steps (same response → same score)
+
+2. **Judge reliability**: Noisy judge scores add noise to the reward, which could be worse than no signal. Need to validate judge correlation with human assessment on a small sample before deploying.
+
+3. **α tuning**: The bonus weight α controls the relative importance of judge reward vs EM reward. Too high → model optimizes for judge approval over correctness. Too low → no effect. Start with α=0.3 for C2, α=0.5 for C1.
+
+4. **Integration with OpenRLHF**: The reward function in OpenRLHF is a simple callable. Replace the current `reward_func_em.py` with a version that additionally queries the judge model. The judge can run as a separate vLLM server or inline.
+
+#### Success Criteria
+
+Same as Tracks A/B: OOD-1000 Gate-1a or Gate-1b.
+
+Additionally for Track C:
+- **Reward variance**: Judge reward should produce meaningful variance within groups (std > 0.1)
+- **Judge-EM correlation**: On correct solutions, judge score should be higher than on wrong solutions (sanity check)
+- **No reward hacking**: Monitor for divergence between judge score trend and EM accuracy trend
+
+---
+
+### Track Priority and Ordering
+
+```
+Track A (RSFT)          ← Run FIRST (fastest, highest expected ROI)
+  ↓ results inform
+Track B (GRPO enriched) ← Run SECOND (tests if RL can work with better structure)
+  ↓ results inform
+Track C (Judge reward)  ← Run THIRD (most complex, but addresses root cause)
+  C2 (EM=0 bonus) first
+  C1 (EM=1 bonus) second
+```
+
+**If Track A succeeds**: Validates that correct solutions exist and can be distilled. Track C becomes especially interesting — can RL match or exceed RSFT by using judge signal?
+
+**If Track A fails**: Suggests the problem is deeper than credit assignment. May need to reconsider model capacity, training data quality, or whether the eval methodology is measuring the right thing.
+
+**If Track B succeeds**: RL CAN work with better signal structure. Track C can further improve it.
+
+**If all tracks fail**: Fundamental limitation of the current setup. Consider: larger model, full fine-tune (no LoRA), different eval domain, or process supervision with human-annotated data.
+
+### Experiment Tracking Template
+
+Each experiment should record:
+
+```
+Attempt ID: [e.g., Q2-A]
+Track: [A / B1 / B2 / C1 / C2]
+Date:
+Changed variable: [exactly one thing different from baseline]
+Hypothesis: [what you expect and why]
+Config delta: [specific parameter changes]
+Training time:
+OOD-1000 result: [accuracy, Δ, p-value, CI]
+Decision gate: [PASS / FAIL]
+Key observation:
+Next step:
+```

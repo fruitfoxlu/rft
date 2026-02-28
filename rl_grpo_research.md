@@ -3491,9 +3491,10 @@ Eliminated hypotheses:
 
 Remaining hypotheses (in decreasing plausibility):
 1. **OOD generalization ceiling**: The model already extracts what it can from the training distribution. Training on more of the same correct solutions doesn't generalize to held-out problems. The 33% error zone on OOD-1000 may consist of problems requiring capabilities the model fundamentally lacks, regardless of which training method we use on the same data.
-2. **Distribution narrowing**: SFT on the model's own correct solutions may push toward a narrower response distribution. Problems where the baseline was marginally correct (stochastic correctness) may flip to wrong because the model is now more confident but in a slightly different way.
-3. **LoRA capacity limit**: rank=32 LoRA on a 14B model provides limited capacity for learning new behavior. The model may need full fine-tuning to meaningfully shift.
-4. **Training data composition**: 10,006 records from 2,637 problems (avg 3.8 per problem). Heavy problems (many correct samples) dominate, while the long tail of hard problems is underrepresented. The model learns to be more like itself on easy problems.
+2. **Distribution narrowing**: SFT on the model's own correct solutions pushes toward a narrower response distribution. The net-negative result (Δ=−1.0pp, 70 regressions vs 60 improvements) is consistent with this: the model becomes more confident in certain solution patterns but loses some marginally-correct answers in the process. It's not learning new capabilities — it's reshuffling which problems it gets right. The fact that RSFT produces MORE discordant pairs than GRPO (130 vs 83) but with worse directionality supports this: stronger training signal (supervised vs RL) causes more change, but the change is still undirected.
+3. **SFT overfitting (3 epochs)**: With 10,006 records and 3 epochs, the model sees each solution ~3 times. This may cause overfitting to training-distribution solution patterns at the expense of OOD generalization. A follow-up could test 1-epoch SFT to check if less training preserves more of the baseline's diversity. However, given that GRPO (which trains very differently) also shows null effect, epoch count alone is unlikely to be the full explanation.
+4. **LoRA capacity limit**: rank=32 LoRA on a 14B model provides limited capacity for learning new behavior. The model may need full fine-tuning to meaningfully shift.
+5. **Training data composition**: 10,006 records from 2,637 problems (avg 3.8 per problem). Heavy problems (many correct samples) dominate, while the long tail of hard problems is underrepresented. The model learns to be more like itself on easy problems.
 
 ### §15.3 Implications for Tracks B and C
 

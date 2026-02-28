@@ -39,7 +39,7 @@ deepspeed --num_gpus 8 \
     --micro_train_batch_size 2 \
     --train_batch_size 128 \
     --learning_rate 2e-5 \
-    --lr_scheduler cosine \
+    --lr_scheduler cosine_with_min_lr \
     --lr_warmup_ratio 0.05 \
     --max_norm 1.0 \
     --gradient_checkpointing \
@@ -52,7 +52,6 @@ deepspeed --num_gpus 8 \
     --lora_dropout 0.0 \
     --packing_samples \
     --save_hf_ckpt \
-    --trust_remote_code \
     2>&1 | tee "$LOG_DIR/sft_train.log"
 
 echo ""

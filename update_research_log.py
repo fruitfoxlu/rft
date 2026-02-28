@@ -519,7 +519,7 @@ def apply_updates(track_id: str):
 
 
 def git_commit_push(track_id: str):
-    """Commit and push the research log update."""
+    """Commit and push the research log update, keeping main in sync."""
     os.chdir(SCRIPT_DIR)
     subprocess.run(["git", "add", "rl_grpo_research.md"], check=True)
 
@@ -531,8 +531,19 @@ def git_commit_push(track_id: str):
 
     commit_msg = f"{msg}\n\nCo-Authored-By: Claude Opus 4.6 <noreply@anthropic.com>"
     subprocess.run(["git", "commit", "-m", commit_msg], check=True)
+
+    # Push to experiment branch
     subprocess.run(["git", "push", "origin", "attempt-26-grpo-20b-em"], check=True)
-    print(f"Committed and pushed: {msg}")
+
+    # Keep main in sync (linear workflow)
+    current = subprocess.run(
+        ["git", "branch", "--show-current"], capture_output=True, text=True
+    ).stdout.strip()
+    subprocess.run(["git", "checkout", "main"], check=True)
+    subprocess.run(["git", "merge", "--ff-only", "attempt-26-grpo-20b-em"], check=True)
+    subprocess.run(["git", "push", "origin", "main"], check=True)
+    subprocess.run(["git", "checkout", current], check=True)
+    print(f"Committed and pushed: {msg} (main synced)")
 
 
 def main():

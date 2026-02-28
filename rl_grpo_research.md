@@ -8,16 +8,17 @@
 
 ## 0. Current State & Pivot History
 
-### Current Status (2026-02-27)
+### Current Status (2026-02-28)
 
-- **Q1 diagnostics complete (§11.32)**: Three diagnostics classify the null result as **DIRECTIONLESS / ALSO_NULL / ALSO_FLAT**.
+- **Track A (RSFT) complete (§15)**: Rejection sampling fine-tuning also produces null effect. RSFT 66.1% vs baseline 67.1%, Δ=−1.0pp (p=0.43). Gate-1a/1b both FAIL.
+- **Q1 diagnostics complete (§11.32)**: Three diagnostics classify the GRPO null result as **DIRECTIONLESS / ALSO_NULL / ALSO_FLAT**.
   - D1: Policy moved (23.5% answers changed, b+c=83) but directionlessly — improvements cancel regressions.
   - D2: ID-heldout also null (Δ=−0.2pp) — not a distribution mismatch; RL doesn't help even on in-distribution data.
   - D3: Pass@8 also flat (Δ=−0.5pp) — model capability unchanged, not just greedy mode selection.
-- **Diagnosis**: The policy produces different outputs but no better ones. The problem is **not** headroom, distribution, or greedy-vs-sampling. The RL signal (binary EM reward + DR-GRPO) fails to induce directional improvement at any level. This points to reward signal quality / credit assignment as the bottleneck.
-- **This is the second independent null result**: gpt-oss-20b (§11.26, Δ=−0.40pp) and qwen2.5-14b (§11.31, Δ=+0.70pp) both show DR-GRPO with pure EM reward produces no measurable improvement.
+- **Both GRPO and RSFT produce null results**: This rules out credit assignment as the sole bottleneck — RSFT bypasses RL entirely yet still fails.
+- **Three null results**: gpt-oss-20b GRPO (Δ=−0.40pp), qwen2.5-14b GRPO (Δ=+0.70pp), qwen2.5-14b RSFT (Δ=−1.0pp).
 - **Key baselines**: gpt-oss-20b 73.8% OOD-1000; qwen2.5-14b 67.0%.
-- **Next steps**: The diagnosis rules out several root causes. Focus should be on: (1) reward signal enrichment (process reward, soft correctness), (2) larger update magnitude (higher LR or full fine-tune), or (3) fundamentally different RL algorithm.
+- **Next steps**: Track B (GRPO enriched: n=32, eps_clip=0.2) and Track C (LLM-as-judge reward, C2 variant first). Track C is now highest priority.
 - **SOP**: See §11.24 for experiment protocol. **Consolidated lessons**: See §12.
 
 ### Pivot 1: gpt-oss-120b → gpt-oss-20b (Phase 1 → Phase 2, A25 → A26)
@@ -3425,3 +3426,70 @@ Decision gate: [PASS / FAIL]
 Key observation:
 Next step:
 ```
+
+---
+
+## §15 Track A Results: RSFT (Rejection Sampling Fine-Tuning)
+
+### §15.1 Experiment Record
+
+```
+Attempt ID: Q2-A
+Track: A (RSFT)
+Date: 2026-02-28
+Changed variable: Training method (SFT on correct solutions vs GRPO RL)
+Hypothesis: Directly supervised fine-tuning on correct solutions should improve accuracy
+             if the model can generate correct reasoning but GRPO fails to reinforce it.
+Config:
+  - Sampling: k=16 per problem, temp=0.6, 3200 problems → 51,200 samples
+  - Filtering: EM=1 only, dedup, max 4 per problem → 10,006 SFT records from 2,637 problems
+  - Training: LoRA r=32 α=64 (same as Q1 GRPO), LR=2e-5, 3 epochs, batch=128
+  - Eval: greedy temp=0, max_tokens=2048, BOXED_SUFFIX prompt
+Training time: ~30 min (SFT), ~3.2h (sampling)
+OOD-1000 result:
+  Baseline: 67.1% (671/1000)
+  RSFT:     66.1% (661/1000)
+  Δ: -1.00pp
+  McNemar p: 0.4300
+  95% CI: [-3.20, +1.20]pp
+  b (base✓ RSFT✗): 70
+  c (base✗ RSFT✓): 60
+  b+c: 130
+Decision gate: Gate-1a FAIL, Gate-1b FAIL
+Key observation: RSFT null effect (slightly negative). 130 discordant pairs (13%) show
+                 the model changes behavior but net direction is zero or slightly harmful.
+Next step: Track B (GRPO enriched) and/or Track C (judge reward)
+```
+
+### §15.2 Analysis
+
+**RSFT also fails** — this is the most important finding from Track A.
+
+Key implications:
+
+1. **Not just a credit-assignment problem**: If GRPO failed because binary EM was too coarse for credit assignment, RSFT should have worked since it bypasses RL entirely and directly trains on correct solutions. The fact that it doesn't improve accuracy suggests the problem is deeper.
+
+2. **130 discordant pairs** (b+c=130, 13%): The model does change behavior after RSFT — 70 problems flip from correct→wrong, 60 flip wrong→correct. This is higher discordance than Q1 GRPO's b+c=83 (8.3%), meaning RSFT causes MORE perturbation but with even less directionality.
+
+3. **Possible explanations**:
+   - **Distribution shift**: SFT on the model's own high-confidence correct solutions may push toward a narrower distribution. Problems where the baseline was marginally correct may flip to incorrect.
+   - **Train/eval domain gap**: The 3200 training problems may not provide useful signal for OOD-1000 problems.
+   - **Model capacity ceiling**: At 67% OOD accuracy, qwen2.5-14b may be near its capacity limit for this task class. The error zone (33%) may contain problems that are genuinely beyond the model's capability regardless of training method.
+   - **BOXED_SUFFIX format ceiling**: The rigid answer-extraction format may constrain improvements.
+
+4. **Comparison with Q1 GRPO diagnostics**:
+
+| Metric | Q1 GRPO (step100) | Track A RSFT |
+|--------|-------------------|--------------|
+| Δ OOD-1000 | +0.70pp | -1.00pp |
+| McNemar p | 0.51 | 0.43 |
+| b+c | 83 (8.3%) | 130 (13.0%) |
+| Verdict | NULL | NULL |
+
+Both methods produce null effects despite very different training mechanisms, suggesting the bottleneck is not in the training algorithm but in the fundamental setup (model, data, or evaluation).
+
+### §15.3 Updated Track Priority
+
+Given Track A failure:
+- **Track B** (GRPO enriched): Still worth trying — larger group size may capture more of the existing solution diversity. But expectations should be lowered.
+- **Track C** (Judge reward): Now the highest-priority track. If the problem is that the model needs qualitatively different reasoning (not just "more of the same correct solutions"), then step-level judge feedback could provide the signal that both binary EM and RSFT miss.

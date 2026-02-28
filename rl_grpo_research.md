@@ -10,15 +10,13 @@
 
 ### Current Status (2026-02-28)
 
-- **Track A (RSFT) complete (§15)**: Rejection sampling fine-tuning also produces null effect. RSFT 66.1% vs baseline 67.1%, Δ=−1.0pp (p=0.43). Gate-1a/1b both FAIL.
-- **Q1 diagnostics complete (§11.32)**: Three diagnostics classify the GRPO null result as **DIRECTIONLESS / ALSO_NULL / ALSO_FLAT**.
-  - D1: Policy moved (23.5% answers changed, b+c=83) but directionlessly — improvements cancel regressions.
-  - D2: ID-heldout also null (Δ=−0.2pp) — not a distribution mismatch; RL doesn't help even on in-distribution data.
-  - D3: Pass@8 also flat (Δ=−0.5pp) — model capability unchanged, not just greedy mode selection.
-- **Both GRPO and RSFT produce null results**: This rules out credit assignment as the sole bottleneck — RSFT bypasses RL entirely yet still fails.
-- **Three null results**: gpt-oss-20b GRPO (Δ=−0.40pp), qwen2.5-14b GRPO (Δ=+0.70pp), qwen2.5-14b RSFT (Δ=−1.0pp).
+- **Track A (RSFT) complete (§15)**: Rejection sampling fine-tuning also produces null effect. RSFT 66.1% vs baseline 67.1%, Δ=−1.0pp (p=0.43). Both gates FAIL. This is the third independent null result and eliminates "credit assignment" as the sole bottleneck.
+- **Track B1 (n=32) training in progress**: GRPO with 4× larger group size, step ~3/200.
+- **Track C2 (judge reward) code ready**: Awaiting GPU availability after B1 completes.
+- **Q1 diagnostics complete (§11.32)**: DIRECTIONLESS / ALSO_NULL / ALSO_FLAT.
+- **Three null results now**: gpt-oss-20b GRPO (Δ=−0.40pp), qwen2.5-14b GRPO (Δ=+0.70pp), qwen2.5-14b RSFT (Δ=−1.0pp). None statistically significant.
 - **Key baselines**: gpt-oss-20b 73.8% OOD-1000; qwen2.5-14b 67.0%.
-- **Next steps**: Track B (GRPO enriched: n=32, eps_clip=0.2) and Track C (LLM-as-judge reward, C2 variant first). Track C is now highest priority.
+- **Key insight from Track A**: The problem is NOT that GRPO fails to assign credit correctly. Even bypassing RL entirely (supervised learning on correct solutions) doesn't help. The bottleneck is deeper — see §15.3 for analysis.
 - **SOP**: See §11.24 for experiment protocol. **Consolidated lessons**: See §12.
 
 ### Pivot 1: gpt-oss-120b → gpt-oss-20b (Phase 1 → Phase 2, A25 → A26)
@@ -3437,15 +3435,20 @@ Next step:
 Attempt ID: Q2-A
 Track: A (RSFT)
 Date: 2026-02-28
-Changed variable: Training method (SFT on correct solutions vs GRPO RL)
-Hypothesis: Directly supervised fine-tuning on correct solutions should improve accuracy
-             if the model can generate correct reasoning but GRPO fails to reinforce it.
+Hypothesis: SFT on the model's own correct solutions should improve accuracy
+  if GRPO's failure was due to credit assignment (binary EM too coarse for RL).
+  RSFT bypasses RL entirely — just supervised learning on "what works."
 Config:
-  - Sampling: k=16 per problem, temp=0.6, 3200 problems → 51,200 samples
-  - Filtering: EM=1 only, dedup, max 4 per problem → 10,006 SFT records from 2,637 problems
-  - Training: LoRA r=32 α=64 (same as Q1 GRPO), LR=2e-5, 3 epochs, batch=128
-  - Eval: greedy temp=0, max_tokens=2048, BOXED_SUFFIX prompt
-Training time: ~30 min (SFT), ~3.2h (sampling)
+  Sampling: k=16 per problem, temp=0.6, 3200 problems
+    → 51,200 total samples, 35,487 correct (69.3%)
+    → 2,637 / 3,200 problems had ≥1 correct solution (82.4%)
+  Filtering: EM=1 only, dedup by (normalized_answer, output_hash),
+    max 4 per problem, prefer shorter solutions
+    → 10,006 SFT training records from 2,637 problems
+  Training: LoRA r=32 α=64 (same config as Q1 GRPO)
+    LR=2e-5, 3 epochs, batch=128, cosine_with_min_lr, DeepSpeed ZeRO-2
+  Eval: greedy temp=0, max_tokens=2048, BOXED_SUFFIX prompt
+Training time: ~30 min SFT + ~3.2h sampling
 OOD-1000 result:
   Baseline: 67.1% (671/1000)
   RSFT:     66.1% (661/1000)
@@ -3456,40 +3459,51 @@ OOD-1000 result:
   c (base✗ RSFT✓): 60
   b+c: 130
 Decision gate: Gate-1a FAIL, Gate-1b FAIL
-Key observation: RSFT null effect (slightly negative). 130 discordant pairs (13%) show
-                 the model changes behavior but net direction is zero or slightly harmful.
-Next step: Track B (GRPO enriched) and/or Track C (judge reward)
+Key observation: Null effect. 130 discordant pairs — model changes behavior
+  but changes are net-zero or slightly harmful.
 ```
 
-### §15.2 Analysis
+### §15.2 What We Learned
 
-**RSFT also fails** — this is the most important finding from Track A.
+**Finding 1: RSFT null effect eliminates "credit assignment" as sole bottleneck.**
 
-Key implications:
+Before Track A, our working hypothesis was: GRPO fails because binary EM reward is too coarse — the model can't learn WHICH reasoning steps to reinforce when the only signal is "correct" or "wrong" at the end. If this were the whole story, RSFT should work because it bypasses the credit assignment problem entirely — just show the model correct solutions and train on them.
 
-1. **Not just a credit-assignment problem**: If GRPO failed because binary EM was too coarse for credit assignment, RSFT should have worked since it bypasses RL entirely and directly trains on correct solutions. The fact that it doesn't improve accuracy suggests the problem is deeper.
+RSFT fails too. This means the problem is NOT primarily about how reward signal reaches the model. Something more fundamental is happening.
 
-2. **130 discordant pairs** (b+c=130, 13%): The model does change behavior after RSFT — 70 problems flip from correct→wrong, 60 flip wrong→correct. This is higher discordance than Q1 GRPO's b+c=83 (8.3%), meaning RSFT causes MORE perturbation but with even less directionality.
-
-3. **Possible explanations**:
-   - **Distribution shift**: SFT on the model's own high-confidence correct solutions may push toward a narrower distribution. Problems where the baseline was marginally correct may flip to incorrect.
-   - **Train/eval domain gap**: The 3200 training problems may not provide useful signal for OOD-1000 problems.
-   - **Model capacity ceiling**: At 67% OOD accuracy, qwen2.5-14b may be near its capacity limit for this task class. The error zone (33%) may contain problems that are genuinely beyond the model's capability regardless of training method.
-   - **BOXED_SUFFIX format ceiling**: The rigid answer-extraction format may constrain improvements.
-
-4. **Comparison with Q1 GRPO diagnostics**:
+**Finding 2: The model changes but doesn't improve (again).**
 
 | Metric | Q1 GRPO (step100) | Track A RSFT |
 |--------|-------------------|--------------|
 | Δ OOD-1000 | +0.70pp | -1.00pp |
 | McNemar p | 0.51 | 0.43 |
-| b+c | 83 (8.3%) | 130 (13.0%) |
-| Verdict | NULL | NULL |
+| b+c (discordant) | 83 (8.3%) | 130 (13.0%) |
+| Answers changed | 235 (23.5%) | — |
+| Net direction | null | null |
 
-Both methods produce null effects despite very different training mechanisms, suggesting the bottleneck is not in the training algorithm but in the fundamental setup (model, data, or evaluation).
+RSFT actually perturbs the model MORE than GRPO (130 vs 83 discordant pairs) but with even less directionality. Training on correct solutions causes roughly equal numbers of regressions (70 flipped wrong) and improvements (60 flipped right). The policy is being modified, but modifications don't correlate with improvement.
 
-### §15.3 Updated Track Priority
+**Finding 3: Possible explanations narrowed.**
 
-Given Track A failure:
-- **Track B** (GRPO enriched): Still worth trying — larger group size may capture more of the existing solution diversity. But expectations should be lowered.
-- **Track C** (Judge reward): Now the highest-priority track. If the problem is that the model needs qualitatively different reasoning (not just "more of the same correct solutions"), then step-level judge feedback could provide the signal that both binary EM and RSFT miss.
+Eliminated hypotheses:
+- ~~"GRPO can't assign credit with binary EM"~~ — RSFT bypasses RL entirely, still fails.
+- ~~"The model just needs to see correct solutions"~~ — It generates them (69.3% pass@16) and trains on them, but doesn't retain the improvement.
+
+Remaining hypotheses (in decreasing plausibility):
+1. **OOD generalization ceiling**: The model already extracts what it can from the training distribution. Training on more of the same correct solutions doesn't generalize to held-out problems. The 33% error zone on OOD-1000 may consist of problems requiring capabilities the model fundamentally lacks, regardless of which training method we use on the same data.
+2. **Distribution narrowing**: SFT on the model's own correct solutions may push toward a narrower response distribution. Problems where the baseline was marginally correct (stochastic correctness) may flip to wrong because the model is now more confident but in a slightly different way.
+3. **LoRA capacity limit**: rank=32 LoRA on a 14B model provides limited capacity for learning new behavior. The model may need full fine-tuning to meaningfully shift.
+4. **Training data composition**: 10,006 records from 2,637 problems (avg 3.8 per problem). Heavy problems (many correct samples) dominate, while the long tail of hard problems is underrepresented. The model learns to be more like itself on easy problems.
+
+### §15.3 Implications for Tracks B and C
+
+**Track B (GRPO enriched)**: Expectations lowered. If the model can't learn from its own correct solutions via direct supervision, it's unlikely to learn from them via RL with better group statistics. But B1 (n=32) still tests whether zero-gradient-on-all-wrong-groups was a quantitative bottleneck — worth completing.
+
+**Track C (judge reward)**: Now the most interesting track. The key question shifts from "how to deliver reward signal" to "can a QUALITATIVELY DIFFERENT reward signal teach the model something new?" C2 provides partial credit on wrong answers based on reasoning quality. If the OOD error zone contains problems where the model has partially correct reasoning but makes final-step errors, C2 could provide gradient signal that neither binary EM nor RSFT can.
+
+**If all tracks fail**: The evidence would point to a fundamental limitation:
+- The model's error zone on OOD problems is "hard-wrong" (not near-misses that training can fix)
+- Or LoRA fine-tuning lacks capacity for meaningful capability shifts
+- Or the training/eval domains are sufficiently different that no in-distribution training helps OOD
+
+In that case, consider: (a) full fine-tune (no LoRA), (b) larger/different model, (c) training on OOD-style problems directly, (d) different eval methodology.

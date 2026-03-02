@@ -59,7 +59,7 @@ def _call_judge(problem: str, response: str, ground_truth: str) -> float:
         "contents": [{"parts": [{"text": prompt}]}],
         "generationConfig": {
             "temperature": 0,
-            "maxOutputTokens": 64,
+            "maxOutputTokens": 1024,
         },
     }).encode("utf-8")
 

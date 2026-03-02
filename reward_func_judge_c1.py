@@ -9,8 +9,7 @@ reward = EM × (1 + α × judge_score)
 This differentiates correct solutions by reasoning quality: clean logical
 reasoning gets higher reward than getting lucky with wrong reasoning.
 
-Judge model: Served on a separate vLLM instance (port 8001).
-Must be started BEFORE training begins.
+Judge model: Gemini 3.1 Pro via Google API (external, no GPU needed).
 
 Loaded by OpenRLHF via --remote_rm_url /home/rlu/Code/rft/reward_func_judge_c1.py
 Must export: reward_func(queries, prompts, labels) -> dict
@@ -19,24 +18,17 @@ Must export: reward_func(queries, prompts, labels) -> dict
 import logging
 import os
 import re
+import time
+import urllib.request
+import json as json_mod
 
 logger = logging.getLogger(__name__)
 
 # ── Configuration ───────────────────────────────────────────────────────
 ALPHA = float(os.environ.get("JUDGE_ALPHA", "0.5"))
-JUDGE_BASE_URL = os.environ.get("JUDGE_BASE_URL", "http://localhost:8001/v1")
-JUDGE_MODEL = os.environ.get("JUDGE_MODEL", "Qwen/Qwen2.5-14B-Instruct")
-
-# Lazy-initialized judge client
-_judge_client = None
-
-
-def _get_judge_client():
-    global _judge_client
-    if _judge_client is None:
-        from openai import OpenAI
-        _judge_client = OpenAI(base_url=JUDGE_BASE_URL, api_key="unused")
-    return _judge_client
+GEMINI_API_KEY = os.environ.get("GEMINI_API_KEY", "")
+GEMINI_MODEL = os.environ.get("GEMINI_MODEL", "gemini-3.1-pro-preview")
+GEMINI_URL = f"https://generativelanguage.googleapis.com/v1beta/models/{GEMINI_MODEL}:generateContent"
 
 
 # ── Judge prompt ────────────────────────────────────────────────────────
@@ -57,33 +49,49 @@ Output ONLY a single decimal number between 0.0 and 1.0, nothing else."""
 
 
 def _call_judge(problem: str, response: str, ground_truth: str) -> float:
-    """Call the judge model to score reasoning quality."""
+    """Call Gemini API to score reasoning quality."""
     prompt = JUDGE_PROMPT_TEMPLATE.format(
         problem=problem,
-        response=response,
+        response=response[:3000],  # Truncate very long responses
         ground_truth=ground_truth,
     )
 
-    try:
-        client = _get_judge_client()
-        resp = client.chat.completions.create(
-            model=JUDGE_MODEL,
-            messages=[{"role": "user", "content": prompt}],
-            max_tokens=16,
-            temperature=0.0,
-            n=1,
-        )
-        text = resp.choices[0].message.content or ""
-        # Extract float from response
-        match = re.search(r"(\d+\.?\d*)", text.strip())
-        if match:
-            score = float(match.group(1))
-            return max(0.0, min(1.0, score))  # Clamp to [0, 1]
-        logger.warning(f"Judge returned unparseable: {text!r}")
-        return 0.5  # Default to middle for correct answers
-    except Exception as e:
-        logger.warning(f"Judge call failed: {e}")
-        return 0.5  # Default to middle for correct answers
+    payload = json_mod.dumps({
+        "contents": [{"parts": [{"text": prompt}]}],
+        "generationConfig": {
+            "temperature": 0,
+            "maxOutputTokens": 64,
+        },
+    }).encode("utf-8")
+
+    for attempt in range(3):
+        try:
+            url = f"{GEMINI_URL}?key={GEMINI_API_KEY}"
+            req = urllib.request.Request(
+                url,
+                data=payload,
+                headers={"Content-Type": "application/json"},
+                method="POST",
+            )
+            with urllib.request.urlopen(req, timeout=30) as resp:
+                data = json_mod.loads(resp.read())
+
+            parts = data["candidates"][0]["content"]["parts"]
+            text = parts[0]["text"]
+            match = re.search(r"(\d+\.?\d*)", text.strip())
+            if match:
+                score = float(match.group(1))
+                return max(0.0, min(1.0, score))
+            logger.warning(f"Judge returned unparseable: {text!r}")
+            return 0.5  # Default to middle for correct answers
+        except Exception as e:
+            logger.warning(f"Judge call attempt {attempt+1} failed: {e}")
+            if attempt < 2:
+                time.sleep(2 ** attempt)
+            continue
+
+    logger.warning("All judge attempts failed, defaulting to 0.5")
+    return 0.5  # Default to middle for correct answers
 
 
 # ── Shared utilities (from reward_func_em.py) ──────────────────────────

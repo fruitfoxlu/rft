@@ -130,7 +130,8 @@ echo "  ★ EM=1 reward range: [1.0, 1.5], EM=0 reward: 0.0"
 echo "  ★ 1 vLLM engine (freed GPU for judge), 200 global steps"
 echo ""
 
-python -m openrlhf.cli.train_ppo_ray \
+# Hide judge GPU from Ray so it can't assign actors/vLLM there
+CUDA_VISIBLE_DEVICES="0,1,3,4,5,6,7" python -m openrlhf.cli.train_ppo_ray \
     --pretrain Qwen/Qwen2.5-14B-Instruct \
     --seed 42 \
     --prompt_data "$TRAIN_DATA" \

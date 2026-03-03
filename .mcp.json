@@ -1,0 +1,9 @@
+{
+  "mcpServers": {
+    "search": {
+      "type": "stdio",
+      "command": "python3",
+      "args": [".claude/mcp-servers/search_server.py"]
+    }
+  }
+}

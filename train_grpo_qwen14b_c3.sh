@@ -1,34 +1,32 @@
 #!/usr/bin/env bash
-# GRPO training for Qwen2.5-14B-Instruct — Track C2 (Judge reward, EM=0 bonus)
+# GRPO training for Qwen2.5-14B-Instruct — Track C3 (Unified judge reward)
 #
-# Track C2: LLM-as-judge process reward (§14, Track C)
-# Changed from Q1:
-#   - Reward function: reward_func_em.py → reward_func_judge_c2.py
-#
-# Hypothesis: Binary EM reward fails at credit assignment because it scores
-#   the entire response as 0 or 1. C2 gives partial credit to wrong answers
-#   based on reasoning quality, providing gradient signal on all-wrong groups.
+# Track C3: LLM-as-judge unified reward with negative penalties.
 #
 # Reward formula:
-#   reward = EM + α × judge_score × (1 - EM)
-#   When EM=1: reward = 1.0 (correctness always dominates)
-#   When EM=0: reward = α × judge_score ∈ [0, α]
-#   Critical invariant: α < 1.0 ensures max(wrong) < min(correct)
+#   When EM=1: reward = 1.0 + α_pos × judge_score    ∈ [1.0, 1.5]
+#   When EM=0: reward = α_neg × (judge_score - 0.5)   ∈ [-0.30, +0.24]
 #
-# Judge: Gemini 2.5 Pro via Google API (external, no GPU needed)
-# α = 0.3 (configurable via JUDGE_ALPHA env var)
+# Combines C1 (quality bonus on correct) and C2 (partial credit on wrong)
+# with NEGATIVE reward for bad wrong answers.
 #
-# GPU allocation (same as Q1/B1/B2 — no local judge needed):
+# Invariant: max(EM=0 reward) = 0.3 < 1.0 = min(EM=1 reward).  ✓
+#
+# Judge: Gemini 3.1 Pro via google-genai SDK (Vertex AI, project=wf30-poc)
+# α_pos = 0.5, α_neg = 0.6 (configurable via env vars)
+#
+# GPU allocation (same as Q1/B1/B2/C1/C2 — no local judge needed):
 #   GPUs 0-3: 2x vLLM TP=2 engines (rollouts)
 #   GPUs 4-7: ZeRO-3 actor + co-located reference model
 #
 # Config delta from Q1:
 #   ┌──────────────────────────┬───────────────────────────┬───────────────────────────┐
-#   │ Parameter                │ Q1                        │ C2                        │
+#   │ Parameter                │ Q1                        │ C3                        │
 #   ├──────────────────────────┼───────────────────────────┼───────────────────────────┤
-#   │ reward function          │ reward_func_em.py         │ reward_func_judge_c2.py ★ │
-#   │ judge                    │ N/A                       │ Gemini 2.5 Pro (API) ★    │
-#   │ JUDGE_ALPHA              │ N/A                       │ 0.3 ★                     │
+#   │ reward function          │ reward_func_em.py         │ reward_func_judge_c3.py ★ │
+#   │ judge                    │ N/A                       │ Gemini 3.1 Pro (SDK) ★    │
+#   │ JUDGE_ALPHA_POS          │ N/A                       │ 0.5 ★                     │
+#   │ JUDGE_ALPHA_NEG          │ N/A                       │ 0.6 ★                     │
 #   │ (all others)             │ same                      │ same                      │
 #   └──────────────────────────┴───────────────────────────┴───────────────────────────┘
 
@@ -38,12 +36,13 @@ export PYTHONUNBUFFERED=1
 export NCCL_DEBUG=INFO
 export NCCL_CUMEM_ENABLE=0
 
-# ── Judge configuration (Gemini API — no local GPU needed) ────────────
-export JUDGE_ALPHA="0.3"
+# ── Judge configuration (Gemini 3.1 Pro via genai SDK — no local GPU needed) ──
+export JUDGE_ALPHA_POS="0.5"
+export JUDGE_ALPHA_NEG="0.6"
 # Uses Vertex AI with gcloud application-default credentials (project=wf30-poc)
 
 # --- Attempt-specific paths ---
-ATTEMPT="c2"
+ATTEMPT="c3"
 export METRICS_LOG_DIR="/mnt/scratch/rft_metrics_qwen14b_${ATTEMPT}"
 export SAMPLES_LOG_DIR="/mnt/scratch/rft_samples_qwen14b_${ATTEMPT}"
 export SPIKE_LOG_PATH="/mnt/scratch/rft_metrics_qwen14b_${ATTEMPT}/spike_log.jsonl"
@@ -52,7 +51,7 @@ mkdir -p "$METRICS_LOG_DIR" "$SAMPLES_LOG_DIR"
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 TRAIN_DATA="${SCRIPT_DIR}/data/sft_rl_pool_3200_boxed.jsonl"
 EVAL_DATA="${SCRIPT_DIR}/data/probe_set_200_ood_boxed.jsonl"
-REWARD_FUNC="${SCRIPT_DIR}/reward_func_judge_c2.py"
+REWARD_FUNC="${SCRIPT_DIR}/reward_func_judge_c3.py"
 SAVE_PATH="/mnt/data/rft_output/qwen14b-grpo-${ATTEMPT}"
 CKPT_PATH="/mnt/data/rft_checkpoints/qwen14b-grpo-${ATTEMPT}"
 
@@ -90,17 +89,17 @@ POOL=$(wc -l < "$TRAIN_DATA") NS=8 TBS=16 RBS=16 EP=1 WARMUP=0.05 LR=5e-7 \
     bash "${SCRIPT_DIR}/preflight_lr.sh" || { echo "ABORT: LR schedule check failed."; exit 1; }
 echo ""
 
-echo "=== GRPO Training — Track C2: Judge reward α=$JUDGE_ALPHA (Gemini 3.1 Pro via genai SDK) ==="
+echo "=== GRPO Training — Track C3: Unified judge reward (Gemini 3.1 Pro via genai SDK) ==="
 echo "  Model:       Qwen/Qwen2.5-14B-Instruct"
 echo "  Train data:  $TRAIN_DATA ($(wc -l < "$TRAIN_DATA") prompts)"
 echo "  Eval data:   $EVAL_DATA (OOD probe: 202 problems, BOXED_SUFFIX)"
-echo "  Reward:      EM + α×judge×(1-EM), α=$JUDGE_ALPHA"
+echo "  Reward:      EM=1: 1+α_pos×judge, EM=0: α_neg×(judge-0.5)"
 echo "  Judge:       Gemini 3.1 Pro (genai SDK, project=wf30-poc)"
 echo "  Save path:   $SAVE_PATH"
 echo "  Checkpoints: $CKPT_PATH"
 echo ""
-echo "  ★ Track C2: Gemini-judged partial credit for EM=0 responses"
-echo "  ★ Invariant: max(EM=0 reward) = $JUDGE_ALPHA < 1.0 = min(EM=1 reward)"
+echo "  ★ Track C3: Unified reward — bonus for correct, negative for bad wrong"
+echo "  ★ EM=1 reward range: [1.0, 1.5], EM=0 reward range: [-0.30, +0.24]"
 echo "  ★ 2 vLLM engines (no GPU needed for judge), 200 global steps"
 echo ""
 

@@ -3340,41 +3340,24 @@ C1 is complementary — run after C2 if C2 shows promise.
 #### Judge Design
 
 ```
-Judge model: TBD (options: same Qwen2.5-14B, a separate model,
-             or external API like Claude)
-
-Judge prompt (draft):
-  "You are evaluating a student's mathematical reasoning.
-   Problem: {problem}
-   Student's solution: {response}
-   Correct answer: {ground_truth}
-
-   Score the reasoning quality from 0.0 to 1.0:
-   - 1.0: Perfect reasoning, correct approach, clear steps
-   - 0.7-0.9: Right approach, minor errors (arithmetic, sign, etc.)
-   - 0.4-0.6: Partially correct approach, significant errors
-   - 0.1-0.3: Wrong approach but shows some mathematical understanding
-   - 0.0: No meaningful reasoning or completely wrong approach
-
-   Output only the numeric score."
-
-Scoring: Extract float from judge response. Clamp to [0, 1].
-Cache: Judge scores can be cached per (problem_hash, response_hash)
-       since they don't change across training steps.
+Judge model: Gemini 3.1 Pro (gemini-3.1-pro-preview)
+  - SDK: google-genai (vertexai=True, project=wf30-poc, location=global)
+  - Auth: gcloud application-default credentials (no API key expiration)
+  - max_output_tokens: 16384 (thinking model needs large budget)
+  - External API — no GPU allocation needed
 ```
+
+Two judge prompts (correct/wrong), scoring rubric 0.0-1.0. See §18.3 for full prompt text. Extract first decimal number from response via regex, clamp to [0, 1].
 
 #### Implementation Considerations
 
-1. **Judge latency**: Judge scoring happens during rollout grading, adding latency per step. Options:
-   - Use a small/fast judge model (e.g., Qwen2.5-7B) served on separate GPUs
-   - Batch judge requests
-   - Cache scores across steps (same response → same score)
+1. **Judge latency**: Gemini 3.1 Pro is a thinking model — each call takes 5-15s. This adds ~30% training time overhead vs pure EM. No GPU cost (external API), but API rate limits apply.
 
-2. **Judge reliability**: Noisy judge scores add noise to the reward, which could be worse than no signal. Need to validate judge correlation with human assessment on a small sample before deploying.
+2. **Judge reliability**: Gemini 3.1 Pro with 16384 token budget produces consistent scores. Early attempt with 1024 tokens was unreliable (see §18.1 lesson #3).
 
-3. **α tuning**: The bonus weight α controls the relative importance of judge reward vs EM reward. Too high → model optimizes for judge approval over correctness. Too low → no effect. Start with α=0.3 for C2, α=0.5 for C1.
+3. **α tuning**: α=0.3 for C2 (conservative, 0.7 gap), α=0.5 for C1 (more aggressive differentiation), α_pos=0.5/α_neg=0.6 for C3 (unified with negative penalties).
 
-4. **Integration with OpenRLHF**: The reward function in OpenRLHF is a simple callable. Replace the current `reward_func_em.py` with a version that additionally queries the judge model. The judge can run as a separate vLLM server or inline.
+4. **Integration with OpenRLHF**: Reward functions (`reward_func_judge_c{1,2,3}.py`) are drop-in replacements for `reward_func_em.py`. They import shared utilities from `reward_func_em.py` and add judge calls. Loaded via `--remote_rm_url`.
 
 #### Success Criteria
 
@@ -3413,7 +3396,7 @@ Each experiment should record:
 
 ```
 Attempt ID: [e.g., Q2-A]
-Track: [A / B1 / B2 / C1 / C2]
+Track: [A / B1 / B2 / C1 / C2 / C3]
 Date:
 Changed variable: [exactly one thing different from baseline]
 Hypothesis: [what you expect and why]
@@ -3571,11 +3554,52 @@ Given that B1-step200 (+1.70pp, p=0.086) is our strongest result, we brainstorme
 - Cost: ~17 hours GPU.
 - Verdict: Low priority. Useful for scientific rigor but doesn't change the "RL+EM is insufficient" conclusion.
 
-### §16.5 Recommended Next Steps
+### §16.5 Track C3 Design: Negative Reward for Wrong Answers
 
-1. **Let C1/C2 finish** (already running). If either shows Δ ≥ +2pp, judge-based reward is validated and Option B becomes the obvious next move.
-2. **MCTS pivot (Option C)**: Use B1-step200 as the base model for MCTS CoT generation. Plan documented in `plan_marco_mcts_adaptation.md`.
-3. **Option B as contingency**: If MCTS pivot needs more time and C1/C2 show promising (but not passing) results, try continuing from B1-step200 with judge reward.
+**Motivation**: C1 gives bonus to correct answers, C2 gives partial credit to wrong answers, but neither *punishes* bad wrong answers. A model that produces completely nonsensical reasoning gets reward=0 — the same as a model that stays silent. There's no active signal to avoid bad reasoning.
+
+**Core idea**: Let the judge score wrong answers, then map low judge scores to *negative* reward. Wrong answers with good reasoning (right approach, arithmetic error) get small positive partial credit. Wrong answers with terrible reasoning get negative reward (punishment).
+
+**Reward formula**:
+```
+When EM=1: reward = 1.0 + α_pos × judge_score     (same as C1, α_pos=0.5)
+When EM=0: reward = α_neg × (judge_score - 0.5)    (centered at 0, can go negative)
+```
+
+With α_neg = 0.6:
+- Wrong, excellent reasoning (judge=0.9):  reward = 0.6 × (0.9 - 0.5) = +0.24
+- Wrong, decent reasoning (judge=0.5):     reward = 0.6 × (0.5 - 0.5) = 0.00
+- Wrong, bad reasoning (judge=0.2):        reward = 0.6 × (0.2 - 0.5) = -0.18
+- Wrong, nonsensical (judge=0.0):          reward = 0.6 × (0.0 - 0.5) = -0.30
+
+**Invariant check**:
+```
+max(EM=0 reward) = α_neg × (1.0 - 0.5) = 0.3
+min(EM=1 reward) = 1.0 + α_pos × 0.0 = 1.0
+Gap = 0.7  ✓  (correct always dominates)
+```
+
+**Why this should help**: GRPO computes advantages *within* a group. With C2, wrong answers range from 0.0 to 0.3 — all positive. With C3, wrong answers range from -0.30 to +0.24. This creates **stronger contrast** within all-wrong groups:
+
+- C2 all-wrong group: advantages range over [0.0, 0.3] → small gradient
+- C3 all-wrong group: advantages range over [-0.30, +0.24] → 2× stronger gradient, with clear push-away from bad reasoning
+
+**Combines C1 + C2**: C3 unifies both tracks — bonus for correct (C1) and shaped reward for wrong (C2) — into a single reward function.
+
+**Implementation**: `reward_func_judge_c3.py`
+- Judge: Gemini 3.1 Pro via google-genai SDK (Vertex AI, project=wf30-poc, location=global)
+- Same judge prompts as C1 (for correct) and C2 (for wrong)
+- max_output_tokens=16384 (lesson from §5.1: thinking models need large token budgets)
+- One judge call per sample (correct uses JUDGE_PROMPT_CORRECT, wrong uses JUDGE_PROMPT_WRONG)
+
+**Priority**: After C1/C2 results. If C1/C2 show the judge reward provides some signal but not enough, C3 amplifies the signal with negative penalties.
+
+### §16.6 Recommended Next Steps
+
+1. **Run C1 → C2 → C3 pipeline** with Gemini 3.1 Pro via google-genai SDK + 16384 token budget. Previous C2 results invalid (API key expired mid-training). C1 never ran (pipeline crash). All three now use the same proven SDK pattern.
+2. **Evaluate each track** at steps 50/100/200 on OOD-1000 with Gate-1a/1b criteria.
+3. **MCTS pivot**: Use B1-step200 as base model for MCTS CoT generation. Plan documented in `plan_marco_mcts_adaptation.md`.
+4. **Option B**: Continue from B1-step200 with judge reward (C1/C2/C3 style) instead of from scratch.
 
 ### §16.6 Theoretical Interpretation
 
@@ -3722,3 +3746,138 @@ DEPO adds a BERT-based difficulty estimator that filters training data before ro
 - Results: +1.5% average improvement on math benchmarks under same compute budget
 
 This is relevant as a potential enhancement if we return to GRPO after MCTS experiments — DEPO could address the zero-advantage problem more elegantly than increasing n_samples (B1's approach).
+
+## §18 Track C: LLM-as-Judge Implementation (C1/C2/C3)
+
+### §18.1 Implementation History and Lessons Learned
+
+The Track C implementation went through several iterations before reaching a working configuration:
+
+1. **First attempt (C2)**: Used Google API key (`GOOGLE_API_KEY`) with `gemini-2.5-pro`. API key expired mid-training → judge scores dropped to 0.000 → C2 was effectively pure EM reward. **Results invalid.**
+
+2. **First C1 attempt**: Switched to Vertex AI REST API with `gcloud auth application-default` credentials (project=wf30-poc). The API test in the training script hit a timeout → `set -euo pipefail` killed the entire pipeline. **C1 never ran.**
+
+3. **Judge token budget issue**: Initially set `maxOutputTokens=1024`. Gemini 3.1 Pro is a *thinking* model — it uses internal reasoning tokens before outputting the score. With only 1024 tokens, the model's thinking was truncated, producing unreliable scores. This was the exact same issue diagnosed in §5.1 where 4096 tokens caused 70% truncation. **Fixed to 16384.**
+
+4. **Model availability**: User explicitly required Gemini 3.1 Pro (not 2.5 Pro). The `gemini-3.1-pro-preview` model is NOT available on the Vertex AI v1 REST endpoint (`us-central1-aiplatform.googleapis.com/v1/...`). It returns 404. **Solution**: Use the `google-genai` Python SDK with `location='global'`, which routes through the correct endpoint.
+
+5. **Final working configuration** (all three tracks):
+   - SDK: `google-genai` (`from google import genai`)
+   - Client: `genai.Client(vertexai=True, project='wf30-poc', location='global')`
+   - Model: `gemini-3.1-pro-preview`
+   - Auth: `gcloud auth application-default` (project-based, no API key expiration)
+   - Token budget: `max_output_tokens=16384`
+
+### §18.2 Track C Reward Functions
+
+All three tracks import shared utilities from `reward_func_em.py` (`extract_model_answer`, `check_correctness`, `_strip_harmony_tokens`) to avoid code duplication.
+
+**C1: Quality bonus on correct answers** (`reward_func_judge_c1.py`)
+```
+reward = EM × (1 + α × judge_score),  α = 0.5
+  EM=1: reward ∈ [1.0, 1.5]  (judge scores reasoning quality)
+  EM=0: reward = 0            (no judge call needed)
+
+Judge prompt: "The student's final answer is CORRECT. Score the reasoning quality..."
+Only calls judge when EM=1. Default fallback: 0.5 (neutral bonus).
+```
+
+**C2: Partial credit on wrong answers** (`reward_func_judge_c2.py`)
+```
+reward = EM + α × judge_score × (1 - EM),  α = 0.3
+  EM=1: reward = 1.0           (no judge call needed)
+  EM=0: reward ∈ [0.0, 0.3]   (judge scores reasoning quality)
+  Invariant: max(EM=0) = 0.3 < 1.0 = min(EM=1)  ✓
+
+Judge prompt: "The student's final answer is WRONG. Score the reasoning quality..."
+Only calls judge when EM=0. Default fallback: 0.0 (no partial credit).
+```
+
+**C3: Unified reward with negative penalties** (`reward_func_judge_c3.py`)
+```
+  EM=1: reward = 1.0 + α_pos × judge_score,  α_pos = 0.5  → [1.0, 1.5]
+  EM=0: reward = α_neg × (judge_score - 0.5), α_neg = 0.6  → [-0.30, +0.24]
+  Invariant: max(EM=0) = 0.3 < 1.0 = min(EM=1)  ✓
+
+Calls judge for BOTH correct and wrong answers.
+Uses JUDGE_PROMPT_CORRECT (EM=1) or JUDGE_PROMPT_WRONG (EM=0).
+Default fallback: 0.5 for correct (neutral bonus), 0.0 for wrong (no credit).
+```
+
+Key design: C3 creates **stronger contrast** within all-wrong groups compared to C2:
+- C2 all-wrong group: rewards in [0.0, 0.3] → 0.3 range
+- C3 all-wrong group: rewards in [-0.30, +0.24] → 0.54 range (1.8× wider)
+- C3 also differentiates correct answers (like C1) — combines both signals
+
+### §18.3 Judge Prompts
+
+Two separate prompts are used, conditioned on whether the student's answer is correct or wrong:
+
+**For correct answers (C1, C3)**:
+- 0.8-1.0: Clear, logical steps; correct approach throughout; well-organized
+- 0.6-0.8: Correct approach, but unnecessary steps, minor confusion
+- 0.4-0.6: Right answer but reasoning has gaps, skipped steps
+- 0.2-0.4: Mostly wrong reasoning that happened to arrive at correct answer (lucky)
+- 0.0-0.2: No meaningful reasoning, answer without justification
+
+**For wrong answers (C2, C3)**:
+- 0.8-1.0: Correct approach, only minor arithmetic/calculation error at the end
+- 0.6-0.8: Right general approach, but errors in setup or intermediate steps
+- 0.4-0.6: Partially correct approach, shows understanding of relevant concepts
+- 0.2-0.4: Wrong approach but shows some mathematical understanding
+- 0.0-0.2: No meaningful reasoning, completely wrong approach, or nonsensical
+
+The judge is instructed to "Output ONLY a single decimal number between 0.0 and 1.0, nothing else." The reward function extracts the first number from the response via regex.
+
+### §18.4 Training Configuration
+
+All C tracks use identical GRPO hyperparameters as Q1/B1/B2 (the only change is the reward function):
+
+| Parameter | Value | Notes |
+|-----------|-------|-------|
+| Model | Qwen/Qwen2.5-14B-Instruct | Same base model |
+| n_samples_per_prompt | 8 | Same as Q1 |
+| eps_clip | 0.1 | Same as Q1 |
+| LoRA rank/alpha | 32/64 | Same as Q1 |
+| LR | 5e-7 | Same as Q1 |
+| vLLM engines | 2 × TP=2 | Same as Q1 |
+| Training steps | 200 | Same as Q1 |
+| Judge | Gemini 3.1 Pro (external API) | No GPU needed |
+
+GPU allocation unchanged: GPUs 0-3 = 2× vLLM TP=2 rollout engines, GPUs 4-7 = ZeRO-3 actor + co-located reference model.
+
+### §18.5 Pipeline Design
+
+Pipeline script: `/mnt/scratch/run_c_tracks.sh`
+
+```
+C1 train (200 steps) → C1 eval (steps 50/100/200) → research log update
+  → C2 train (200 steps) → C2 eval (steps 50/100/200) → research log update
+    → C3 train (200 steps) → C3 eval (steps 50/100/200) → research log update
+```
+
+Each track:
+1. Cleans GPU processes (Ray, vLLM, OpenRLHF)
+2. Clears old data for clean run
+3. Applies patches
+4. Runs Gemini 3.1 Pro API test (3 retries)
+5. Runs preflight LR check
+6. Trains 200 steps with judge reward
+7. Evaluates at steps 50/100/200 on OOD-1000
+8. Updates research log via `update_research_log.py`
+
+Estimated time: ~3-4 hours per track (training dominates, judge API calls add ~30% latency), ~10-12 hours total for all three tracks.
+
+### §18.6 What We Expect
+
+**C1 prediction**: Modest improvement over Q1. Differentiating correct answers by quality should help the model prefer robust reasoning paths. But C1 doesn't address the zero-gradient problem on all-wrong groups (same as Q1 for ~33% of problems).
+
+**C2 prediction**: Most likely to show improvement. Directly addresses the identified bottleneck: all-wrong groups now have reward variance → gradient signal exists for all problems. Risk: partial credit might incentivize verbose reasoning without actual improvement.
+
+**C3 prediction**: If either C1 or C2 shows some signal, C3 should amplify it. The negative reward creates stronger push-away from bad reasoning patterns. Risk: if judge scores are noisy, the negative signal could be harmful (pushing away from random things rather than truly bad reasoning).
+
+**If all C tracks fail**: Strong evidence that the bottleneck is NOT reward signal quality, but something more fundamental (model capacity, training data, eval methodology). MCTS pivot becomes the primary strategy.
+
+### §18.7 Track C Results
+
+*Results will be added here by `update_research_log.py` as each track completes.*

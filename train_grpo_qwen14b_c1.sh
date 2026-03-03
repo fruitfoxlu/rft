@@ -34,7 +34,7 @@ export NCCL_CUMEM_ENABLE=0
 
 # ── Judge configuration (Gemini API — no local GPU needed) ────────────
 export JUDGE_ALPHA="0.5"
-# GEMINI_API_KEY must be set in environment (from ~/.bashrc)
+# Uses Vertex AI with gcloud application-default credentials (project=wf30-poc)
 
 # --- Attempt-specific paths ---
 ATTEMPT="c1"
@@ -60,22 +60,22 @@ if [ ! -f "$EVAL_DATA" ]; then
     exit 1
 fi
 
-# ── Verify Gemini API key ────────────────────────────────────────────
-if [ -z "${GEMINI_API_KEY:-}" ]; then
-    echo "ERROR: GEMINI_API_KEY not set. Export it before running."
-    exit 1
-fi
-
-echo "=== Testing Gemini API ==="
-JUDGE_TEST=$(python3 -c "
-import urllib.request, json, os
-url = f'https://generativelanguage.googleapis.com/v1beta/models/gemini-3.1-pro-preview:generateContent?key={os.environ[\"GEMINI_API_KEY\"]}'
-data = json.dumps({'contents':[{'parts':[{'text':'Say ready'}]}],'generationConfig':{'temperature':0,'maxOutputTokens':64}}).encode()
-req = urllib.request.Request(url, data=data, headers={'Content-Type':'application/json'}, method='POST')
-resp = json.loads(urllib.request.urlopen(req, timeout=30).read())
-print(resp['candidates'][0]['content']['parts'][0]['text'])
-" 2>/dev/null)
+# ── Verify Gemini 3.1 Pro access (google-genai SDK) ─────────────────
+echo "=== Testing Gemini 3.1 Pro (genai SDK, project=${GCP_PROJECT:-wf30-poc}) ==="
+for _try in 1 2 3; do
+    JUDGE_TEST=$(python3 -c "
+from google import genai
+client = genai.Client(vertexai=True, project='wf30-poc', location='global')
+resp = client.models.generate_content(model='gemini-3.1-pro-preview', contents='Say ready')
+print(resp.text.strip())
+" 2>&1) && break
+    echo "  Attempt $_try failed, retrying in 5s..."
+    sleep 5
+done
 echo "  Gemini test: $JUDGE_TEST"
+if [ -z "$JUDGE_TEST" ]; then
+    echo "WARNING: Gemini API test returned empty. Judge may not work during training."
+fi
 
 # --- Pre-flight LR check ---
 echo ""
@@ -84,12 +84,12 @@ POOL=$(wc -l < "$TRAIN_DATA") NS=8 TBS=16 RBS=16 EP=1 WARMUP=0.05 LR=5e-7 \
     bash "${SCRIPT_DIR}/preflight_lr.sh" || { echo "ABORT: LR schedule check failed."; exit 1; }
 echo ""
 
-echo "=== GRPO Training — Track C1: Judge reward α=$JUDGE_ALPHA (Gemini 3.1 Pro) ==="
+echo "=== GRPO Training — Track C1: Judge reward α=$JUDGE_ALPHA (Gemini 3.1 Pro via genai SDK) ==="
 echo "  Model:       Qwen/Qwen2.5-14B-Instruct"
 echo "  Train data:  $TRAIN_DATA ($(wc -l < "$TRAIN_DATA") prompts)"
 echo "  Eval data:   $EVAL_DATA (OOD probe: 202 problems, BOXED_SUFFIX)"
 echo "  Reward:      EM×(1+α×judge), α=$JUDGE_ALPHA"
-echo "  Judge:       Gemini 3.1 Pro (API, no GPU)"
+echo "  Judge:       Gemini 3.1 Pro (genai SDK, project=wf30-poc)"
 echo "  Save path:   $SAVE_PATH"
 echo "  Checkpoints: $CKPT_PATH"
 echo ""

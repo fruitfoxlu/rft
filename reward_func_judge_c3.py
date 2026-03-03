@@ -35,7 +35,7 @@ ALPHA_POS = float(os.environ.get("JUDGE_ALPHA_POS", "0.5"))   # bonus for correc
 ALPHA_NEG = float(os.environ.get("JUDGE_ALPHA_NEG", "0.6"))   # scale for wrong
 GCP_PROJECT = os.environ.get("GCP_PROJECT", "wf30-poc")
 GEMINI_MODEL = os.environ.get("GEMINI_MODEL", "gemini-3.1-pro-preview")
-GEMINI_FALLBACK = os.environ.get("GEMINI_FALLBACK", "gemini-3.1-flash-lite-preview")
+GEMINI_FALLBACK = os.environ.get("GEMINI_FALLBACK", "gemini-3-flash-preview")
 
 # Lazy-init genai client
 _genai_client = None
@@ -130,19 +130,24 @@ def _call_judge(problem: str, response: str, ground_truth: str,
                 time.sleep(2 ** attempt)
             continue
 
-    # Fallback to flash-lite model
-    try:
-        logger.warning(f"Primary judge failed, falling back to {GEMINI_FALLBACK}")
-        client = _get_client()
-        resp = client.models.generate_content(
-            model=GEMINI_FALLBACK, contents=prompt, config=config,
-        )
-        score = _parse_score(resp.text)
-        if score is not None:
-            return score
-        logger.warning(f"Fallback judge returned unparseable: {resp.text!r}")
-    except Exception as e:
-        logger.warning(f"Fallback judge failed: {e}")
+    # Fallback to gemini-3-flash-preview with 3 retries
+    logger.warning(f"Primary judge failed, falling back to {GEMINI_FALLBACK}")
+    for attempt in range(3):
+        try:
+            client = _get_client()
+            resp = client.models.generate_content(
+                model=GEMINI_FALLBACK, contents=prompt, config=config,
+            )
+            score = _parse_score(resp.text)
+            if score is not None:
+                return score
+            logger.warning(f"Fallback judge returned unparseable: {resp.text!r}")
+            return default
+        except Exception as e:
+            logger.warning(f"Fallback judge attempt {attempt+1} failed: {e}")
+            if attempt < 2:
+                time.sleep(2 ** attempt)
+            continue
 
     logger.warning(f"All judge attempts failed, defaulting to {default}")
     return default

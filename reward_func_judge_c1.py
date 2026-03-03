@@ -31,6 +31,7 @@ logger = logging.getLogger(__name__)
 ALPHA = float(os.environ.get("JUDGE_ALPHA", "0.5"))
 GCP_PROJECT = os.environ.get("GCP_PROJECT", "wf30-poc")
 GEMINI_MODEL = os.environ.get("GEMINI_MODEL", "gemini-3.1-pro-preview")
+GEMINI_FALLBACK = os.environ.get("GEMINI_FALLBACK", "gemini-3.1-flash-lite-preview")
 
 # Lazy-init genai client
 _genai_client = None
@@ -63,8 +64,18 @@ The student's final answer is CORRECT. Score the reasoning quality from 0.0 to 1
 Output ONLY a single decimal number between 0.0 and 1.0, nothing else."""
 
 
+def _parse_score(text: str) -> float | None:
+    """Extract a score from judge response text. Returns None if unparseable."""
+    if text is None:
+        return None
+    match = re.search(r"(\d+\.?\d*)", text.strip())
+    if match:
+        return max(0.0, min(1.0, float(match.group(1))))
+    return None
+
+
 def _call_judge(problem: str, response: str, ground_truth: str) -> float:
-    """Call Gemini 3.1 Pro to score reasoning quality."""
+    """Call Gemini 3.1 Pro to score reasoning quality, with flash-lite fallback."""
     from google.genai import types
 
     prompt = JUDGE_PROMPT_TEMPLATE.format(
@@ -73,29 +84,42 @@ def _call_judge(problem: str, response: str, ground_truth: str) -> float:
         ground_truth=ground_truth,
     )
 
+    config = types.GenerateContentConfig(
+        temperature=0,
+        max_output_tokens=16384,
+    )
+
+    # Try primary model (gemini-3.1-pro-preview) with 3 retries
     for attempt in range(3):
         try:
             client = _get_client()
             resp = client.models.generate_content(
-                model=GEMINI_MODEL,
-                contents=prompt,
-                config=types.GenerateContentConfig(
-                    temperature=0,
-                    max_output_tokens=16384,
-                ),
+                model=GEMINI_MODEL, contents=prompt, config=config,
             )
-            text = resp.text.strip()
-            match = re.search(r"(\d+\.?\d*)", text)
-            if match:
-                score = float(match.group(1))
-                return max(0.0, min(1.0, score))
-            logger.warning(f"Judge returned unparseable: {text!r}")
-            return 0.5  # Default to middle for correct answers
+            score = _parse_score(resp.text)
+            if score is not None:
+                return score
+            logger.warning(f"Judge returned unparseable: {resp.text!r}")
+            return 0.5
         except Exception as e:
             logger.warning(f"Judge call attempt {attempt+1} failed: {e}")
             if attempt < 2:
                 time.sleep(2 ** attempt)
             continue
+
+    # Fallback to flash-lite model
+    try:
+        logger.warning(f"Primary judge failed, falling back to {GEMINI_FALLBACK}")
+        client = _get_client()
+        resp = client.models.generate_content(
+            model=GEMINI_FALLBACK, contents=prompt, config=config,
+        )
+        score = _parse_score(resp.text)
+        if score is not None:
+            return score
+        logger.warning(f"Fallback judge returned unparseable: {resp.text!r}")
+    except Exception as e:
+        logger.warning(f"Fallback judge failed: {e}")
 
     logger.warning("All judge attempts failed, defaulting to 0.5")
     return 0.5

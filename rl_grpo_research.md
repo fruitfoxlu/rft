@@ -3881,3 +3881,33 @@ Estimated time: ~3-4 hours per track (training dominates, judge API calls add ~3
 ### §18.7 Track C Results
 
 *Results will be added here by `update_research_log.py` as each track completes.*
+
+## §19 Future Directions: Alternative Base Models
+
+### §19.1 Qwen2.5-Math-7B-Instruct as RL Base
+
+**Idea**: Replace the general-purpose Qwen2.5-14B-Instruct with the math-specialized Qwen2.5-Math-7B-Instruct as the base model for GRPO training.
+
+**Motivation**: Across all tracks so far (Q1, B1, B2, A, C1/C2/C3), the general model struggles to improve via RL. A core question is whether the bottleneck is reward signal quality (addressed by Tracks B/C) or the base model's math knowledge. RL can only surface and reinforce capabilities the model already has — if the base model lacks strong math foundations, no amount of reward shaping will teach it new math.
+
+**Pros**:
+- Math-specialized: trained specifically on mathematical reasoning, should have stronger foundations
+- 7B is faster to train — more experiments per GPU-hour, faster iteration
+- Higher pass@k expected → more reward variance in GRPO groups → better gradient signal
+- Directly tests the hypothesis: "is the bottleneck the model, not the reward?"
+
+**Cons**:
+- 7B has less general capacity than 14B — lower ceiling for complex multi-step reasoning
+- If baseline accuracy is already very high (85%+), RL headroom shrinks
+- Math-specialized models are already RL-tuned for math — the low-hanging fruit may already be picked
+- All existing baselines (Q1, B1, B2, C tracks) become incomparable — fresh evaluation needed
+
+**Before committing**: Run baseline eval of Qwen2.5-Math-7B-Instruct on our OOD-1000 benchmark. The sweet spot is 70-80% accuracy (enough headroom for RL, but strong enough foundations to benefit from reward shaping). If baseline is >85%, RL improvement may be marginal. If <60%, the model may lack capacity for our problem distribution.
+
+**Action items**:
+1. Evaluate Qwen2.5-Math-7B-Instruct on OOD-1000 (greedy@1, BOXED_SUFFIX)
+2. Run pass@8 on wrong problems to estimate GRPO headroom
+3. If results are promising, design a Q1-equivalent run with the math model as a new baseline
+4. Consider also: Qwen2.5-Math-1.5B-Instruct (tiny, fast iteration) and Qwen2.5-Math-72B-Instruct (if compute allows)
+
+**Status**: Idea documented. Circle back after Track C results.

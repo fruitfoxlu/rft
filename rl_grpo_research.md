@@ -3508,3 +3508,217 @@ Remaining hypotheses (in decreasing plausibility):
 - Or the training/eval domains are sufficiently different that no in-distribution training helps OOD
 
 In that case, consider: (a) full fine-tune (no LoRA), (b) larger/different model, (c) training on OOD-style problems directly, (d) different eval methodology.
+
+## §16 Track B1 Results & Enhancement Options
+
+### §16.1 B1 Evaluation Results (n_samples=32, eps_clip=0.1)
+
+| Checkpoint | OOD-1000 Accuracy | Δ vs baseline (67.1%) | p-value (McNemar) | Gate-1a | Gate-1b |
+|---|---|---|---|---|---|
+| b1-step50 | 67.0% | -0.10pp | 1.0000 | FAIL | FAIL |
+| b1-step100 | 66.8% | -0.30pp | 0.8358 | FAIL | FAIL |
+| **b1-step200** | **68.8%** | **+1.70pp** | **0.0857** | FAIL | FAIL |
+
+B1-step200 is the **best result across all tracks** (Q1, B1, B2, Track A RSFT). The p-value (0.086) is marginally significant (passes p<0.10), but the effect size (+1.70pp) falls short of the Gate-1a minimum (+2.0pp). The learning curve is non-monotonic: step50/100 are at baseline, then step200 jumps — suggesting the model needs substantial training to show any RL effect at n=32.
+
+### §16.2 B2 Evaluation Results (n_samples=8, eps_clip=0.2)
+
+| Checkpoint | OOD-1000 Accuracy | Δ vs baseline (67.1%) | p-value (McNemar) | Gate-1a | Gate-1b |
+|---|---|---|---|---|---|
+| b2-step50 | 68.2% | +1.10pp | 0.2780 | FAIL | FAIL |
+| b2-step100 | 67.3% | +0.20pp | 0.9152 | FAIL | FAIL |
+| b2-step200 | 67.9% | +0.80pp | 0.4557 | FAIL | FAIL |
+
+B2 shows no clear trend. The best checkpoint (step50, +1.10pp) is well within noise. Wider clipping (eps_clip=0.2) did not help.
+
+### §16.3 Cross-Track Summary (All EM-based tracks)
+
+| Track | Config | Best Checkpoint | Best Δ | p-value | Verdict |
+|---|---|---|---|---|---|
+| Q1 | n=8, ε=0.1 | step200 | +0.50pp | 0.62 | NULL |
+| B1 | n=32, ε=0.1 | step200 | **+1.70pp** | **0.086** | Marginal, FAIL gate |
+| B2 | n=8, ε=0.2 | step50 | +1.10pp | 0.28 | NULL |
+| Track A (RSFT) | SFT 3 epochs | — | -1.00pp | — | NULL (negative) |
+
+B1 is the only track showing any signal. The n=32 configuration (4× more samples per prompt) appears to matter — it provides better group statistics for advantage estimation, reducing the zero-advantage problem identified in Q1 diagnostics.
+
+### §16.4 B1-step200 Enhancement Options (Brainstorm)
+
+Given that B1-step200 (+1.70pp, p=0.086) is our strongest result, we brainstormed options to push it past the Gate-1a threshold:
+
+**Option A: Continue training beyond step 200**
+- Extend B1 for 100-200 more steps from the step200 checkpoint.
+- Risk: B1-step100 was *worse* than step200 (-0.30pp vs +1.70pp), showing a non-monotonic learning curve. More steps may overfit or oscillate. B2 also peaked early (step50) and degraded at step200.
+- Cost: ~8 hours GPU.
+- Verdict: Moderate risk. The non-monotonic pattern suggests we may already be near a local optimum for EM reward.
+
+**Option B: Continue from B1-step200 with Gemini judge reward**
+- Use B1-step200 as the starting checkpoint for a second stage of GRPO, but replace EM reward with the Gemini judge (C1/C2-style reward).
+- Rationale: EM got the model to +1.70pp. The judge provides reward signal where EM is blind — partial credit on wrong answers (C2) and quality differentiation on correct answers (C1). This could push past the gate if the remaining errors are "near-misses" that benefit from shaped reward.
+- Difference from current C1/C2: C1/C2 train from vanilla Qwen2.5-14B-Instruct. This variant starts from B1-step200 (already slightly improved).
+- Cost: ~17 hours GPU per variant.
+- Verdict: **Strong option.** Combines the marginal EM gains with richer reward signal. Worth trying if C1/C2 from scratch also show marginal improvement.
+
+**Option C: Use B1-step200 as base model for MCTS pipeline**
+- Instead of running MCTS CoT generation on vanilla Qwen2.5-14B-Instruct, use B1-step200 as the generator model.
+- Rationale: If B1 learned even marginal reasoning improvements, the MCTS trees it produces would be higher quality — more correct paths found per problem, better reasoning chains. This leads to better SFT/DPO training data.
+- Cost: No additional GPU vs vanilla MCTS — just swap the model path.
+- Verdict: **Recommended.** Free improvement if we're pivoting to MCTS anyway. Can run both (vanilla base vs B1-step200 base) and compare MCTS success rates as a quick sanity check.
+
+**Option D: Second seed to confirm signal**
+- Rerun B1 with a different random seed to check if +1.70pp is reproducible.
+- Risk: Even if confirmed, +1.70pp still fails the effect size gate. Two seeds showing +1.70pp would lower the p-value but not change the practical conclusion.
+- Cost: ~17 hours GPU.
+- Verdict: Low priority. Useful for scientific rigor but doesn't change the "RL+EM is insufficient" conclusion.
+
+### §16.5 Recommended Next Steps
+
+1. **Let C1/C2 finish** (already running). If either shows Δ ≥ +2pp, judge-based reward is validated and Option B becomes the obvious next move.
+2. **MCTS pivot (Option C)**: Use B1-step200 as the base model for MCTS CoT generation. Plan documented in `plan_marco_mcts_adaptation.md`.
+3. **Option B as contingency**: If MCTS pivot needs more time and C1/C2 show promising (but not passing) results, try continuing from B1-step200 with judge reward.
+
+### §16.6 Theoretical Interpretation
+
+The B1 result (+1.70pp at n=32) vs Q1 (+0.50pp at n=8) supports the hypothesis from §11.32 that **group size is the primary bottleneck for EM-based GRPO**. With n=8, ~33% of groups have all-wrong responses (zero advantage, zero gradient). With n=32, this drops to ~4%, providing much better gradient signal.
+
+However, even with near-complete gradient coverage (n=32), the effect is still marginal (+1.70pp). This suggests a **ceiling on what binary EM reward can teach**: the model can slightly adjust its distribution toward correct answers, but lacks the reward resolution to learn *why* an answer is wrong or *how* to improve its reasoning process. This is consistent with the paper findings in Marco-o1 v2 — binary reward signals lead to "formalistic thinking" rather than genuine capability improvement.
+
+## §17 Pivot: MCTS-Based CoT Data Construction (Marco-o1 Approach)
+
+### §17.1 Motivation
+
+After 6 tracks of GRPO+EM experiments (Q1, B1, B2, Track A RSFT, and pending C1/C2), the strongest result is B1-step200 at +1.70pp — marginal and below our Gate-1a threshold. The evidence indicates:
+
+1. **Binary EM reward is too sparse** — no gradient on all-wrong groups, no reward shaping for partial progress
+2. **Online RL with LoRA has limited capacity** — the policy can't explore enough during training
+3. **Training data is seen only once** — 200 steps × 16 batch = 3200 unique prompts, each seen in 1 group
+
+We pivot to an offline approach based on the **Marco-o1 v2 paper** (arXiv:2503.01461, accepted ACL 2025 main conference): construct structured chain-of-thought data via Monte Carlo Tree Search, then train with SFT + DPO.
+
+### §17.2 Paper Summary: Marco-o1 v2
+
+**Title**: "Marco-o1 v2: Towards Widening The Distillation Bottleneck for Reasoning Models"
+
+**Core finding**: Standard distillation of long-CoT reasoning from large models to small models (≤14B) fails — small models exhibit "formalistic long-time thinking" where they:
+- Repeat content and over-reflect without making progress
+- Generate verbose reasoning that mimics the structure but not the substance of good reasoning
+- Fail to produce final answers (infinite loops)
+
+**Proposed solution**: Use MCTS to construct CoT data *from scratch* using the target model itself (not distilled from a larger model). The MCTS tree explores multiple reasoning paths per problem, collecting correct and incorrect paths. Training pipeline:
+
+1. **MCTS CoT Generation** — Tree search with UCT node selection, thinking/reflection/double-check/answer node types
+2. **SFT** — Train on best correct paths
+3. **DPO** — Train on (correct, incorrect) path pairs with CoT-aware modifications:
+   - Length-balanced pair selection (similar-length chosen/rejected)
+   - Conservative DPO (cDPO) with label smoothing for noise robustness
+   - Masking-based DPO (mask shared prefix, learn only from divergence points)
+   - Joint SFT+DPO loss for stability
+
+**Results**: On GSM8K and MATH benchmarks, MCTS+SFT+DPO outperforms standard distillation and RL approaches for 8B models. Structured tree data is more effective than linear CoT data.
+
+**Repo**: https://github.com/AIDC-AI/Marco-o1 (cloned at `/home/rlu/Code/Marco-o1`)
+
+### §17.3 Why This Should Work Where GRPO Failed
+
+| Problem with GRPO+EM | How MCTS+SFT+DPO addresses it |
+|---|---|
+| Binary reward (0/1) gives no gradient on all-wrong groups (~33% of problems at n=8) | MCTS explores multiple paths per problem; even hard problems yield partial successes via backtracking and reflection nodes |
+| LoRA rank 32 may lack capacity for online RL exploration | SFT/DPO is much more stable with LoRA — proven at scale in distillation literature |
+| 200 steps × 16 batch = 3200 unique prompts, each seen once | MCTS generates 4-16 reasoning paths per problem offline, then SFT on all of them (multi-epoch) |
+| No reward shaping (only final-answer correctness) | MCTS tree structure naturally decomposes reasoning into verifiable sub-steps; backtracking on wrong paths teaches error correction |
+| RL instability (ratio clipping, KL penalty, gradient spikes) | SFT is supervised (stable); DPO is semi-supervised (much more stable than PPO/GRPO) |
+
+### §17.4 MCTS Architecture (Marco-o1 v2)
+
+The MCTS engine uses UCT (Upper Confidence bounds applied to Trees) with the following node types:
+
+```
+Root (problem)
+├── SubTaskNode: break problem into parts
+│   ├── ThinkingNode: work through calculations
+│   │   ├── ThinkingNode: continue reasoning
+│   │   │   ├── DoubleCheckNode: verify calculations
+│   │   │   │   └── AnswerNode: final \boxed{} answer  ← EVALUATE HERE
+│   │   │   └── DoubleCheckNode: different verification
+│   │   │       └── AnswerNode: different answer
+│   │   └── DoubleCheckNode: ...
+│   └── ThinkingNode: alternative approach
+│       └── ...
+└── SubTaskNode: different decomposition
+    └── ...
+```
+
+On wrong answers, the engine backtracks and inserts:
+- **ReflectionNode**: "Wait, I made an error. Let me reconsider."
+- **ThinkingFromScratchNode**: Complete rethink with fresh approach
+
+This creates diverse reasoning traces — the model learns both correct reasoning AND error recovery.
+
+Key parameters:
+- `max_rollout_time`: 16 (exploration rounds per problem)
+- `max_tokens`: 512 (per-node generation limit)
+- `search_reward_threshold`: [2, 4] (stop after 4 correct paths, or give up if <2 after 4× rollouts)
+- Exploration constant C = 1.414 (standard UCT)
+
+### §17.5 Adaptation for Our Setup
+
+**Model**: Qwen2.5-14B-Instruct (same as GRPO experiments), optionally B1-step200 LoRA merged
+
+**Data**: Same 3200 math problems from `data/sft_rl_pool_3200.jsonl`
+
+**Evaluator**: Our proven `extract_model_answer()` + `check_correctness()` from `reward_func_em.py` (Marco-o1's built-in math evaluator is a stub)
+
+**Code prepared** (Steps 1-3 complete):
+
+| File | Purpose | Status |
+|---|---|---|
+| `prepare_mcts_data.py` | Convert JSONL training pool → MCTS input format | Done, tested |
+| `mcts_math_evaluator.py` | Real math evaluator (imports from `reward_func_em.py`) | Done, tested |
+| `mcts_configs/math_config.json` | MCTS config: math prompt, action tree, node types | Done |
+| `plan_marco_mcts_adaptation.md` | Full implementation plan (9 steps) | Done, committed |
+
+**What remains** (Steps 4-9, needs GPU):
+
+| Step | Description | Est. Time |
+|---|---|---|
+| 4 | vLLM server + MCTS tree generation (3200 problems) | 12-15h |
+| 5 | Extract SFT data (best correct paths) | 1h |
+| 6 | Extract DPO data (correct/incorrect pairs) | 1h |
+| 7 | SFT training (3 epochs, LoRA rank 32) | 4-6h |
+| 8 | DPO training (1 epoch, β=0.1) | 2-3h |
+| 9 | OOD-1000 eval (paired comparison) | 2-3h |
+
+Total: ~24-30 hours after GPU availability.
+
+### §17.6 Key Differences from GRPO Pipeline
+
+| Dimension | GRPO + EM (Tracks Q1/B1/B2) | MCTS + SFT + DPO |
+|---|---|---|
+| Training signal | Binary (0/1 per response) | Rich (structured CoT paths with backtracking) |
+| Data generation | Online (during training, coupled with policy) | Offline (decoupled, MCTS explores freely) |
+| Data efficiency | Each problem seen ~1× in 200 steps | Each problem generates 4-16 reasoning paths |
+| Training stability | RL instability (gradient spikes, ratio clipping) | SFT is stable; DPO is semi-supervised |
+| Error correction | None — model only knows if final answer is right/wrong | MCTS reflection/backtracking teaches error recovery |
+| Compute | ~17h training | ~15h MCTS + ~8h training = ~23h total |
+| Interpretability | Black-box policy gradient | Explicit reasoning trees (inspectable, debuggable) |
+
+### §17.7 Risks and Mitigations
+
+| Risk | Likelihood | Mitigation |
+|---|---|---|
+| MCTS finds few correct paths for hard problems | Medium | Our pass@8 data shows ~67% of problems are correct at greedy; MCTS should easily find paths for these. For the remaining ~33%, MCTS with 16 rollouts + backtracking should solve some that pass@8 missed. |
+| MCTS generation takes too long (>24h) | Medium | Parallelize with 2+ vLLM servers. Reduce `max_rollout_time` to 8. Process problems in difficulty order. |
+| SFT on structured CoT doesn't transfer to free-form eval | Low | Eval uses same `\boxed{}` format. The XML tags structure the output but model still learns the underlying math reasoning. |
+| DPO overfits to MCTS data distribution | Medium | Use cDPO with label smoothing. Keep DPO to 1 epoch. Length-balanced pair selection. |
+| Model degrades on problems it already solves | Low | Monitor regression rate (base correct → checkpoint wrong) in paired eval. Expect <5%. |
+
+### §17.8 DEPO: Related Work in the Marco-o1 Repo
+
+The Marco-o1 repo also includes **DEPO** (Difficulty-Estimated Policy Optimization, arXiv:2602.06375), which addresses a problem we observed directly: GRPO wastes compute on problems that are too easy (all correct, zero variance in advantage) or too hard (all wrong, zero advantage).
+
+DEPO adds a BERT-based difficulty estimator that filters training data before rollouts:
+- Achieves 2× reduction in rollout cost without performance loss
+- Orthogonal to algorithm choice (works with GRPO, DAPO, etc.)
+- Results: +1.5% average improvement on math benchmarks under same compute budget
+
+This is relevant as a potential enhancement if we return to GRPO after MCTS experiments — DEPO could address the zero-advantage problem more elegantly than increasing n_samples (B1's approach).

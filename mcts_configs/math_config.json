@@ -1,0 +1,97 @@
+{
+    "desc": "math_reasoning_qwen14b",
+    "mode": "normal",
+    "max_rollout_time": 16,
+    "max_tokens": 512,
+    "output_tree": true,
+    "input_path": "/home/rlu/Code/rft/data/mcts_input_3200.json",
+    "output_folder": "math_cot",
+    "generate_func": "local",
+    "search_reward_threshold": [2, 4],
+    "evaluate_func": "math",
+    "use_for_wrong_answer": {"double_check": {"reflection": 1}},
+    "use_mini_step": false,
+    "use_function_call": false,
+    "use_step": false,
+    "url1": "http://localhost:40000/generate",
+    "url2": "http://localhost:40000/generate",
+    "base_prompt": "You are solving a mathematical problem. Show your work step by step.\n\nFirst, break down the problem in <sub-task> to identify what needs to be solved.\nIn <thinking>, work through each sub-task carefully, showing all calculations.\nIn <double-check>, verify your calculations and logic for errors.\nIn <reflection>, if you found errors, correct them and rethink.\nIn <answer>, state your final answer clearly using \\boxed{answer}.\n\nNote: these tags cannot be nested but can be sequential. Keep actions within tags atomic.\n\nNow the question is: ",
+    "action_tree": {
+        "base": {
+            "prefill_text": [],
+            "description": "User Question",
+            "show_in_history": true,
+            "special_model": false,
+            "next_step": {
+                "sub_task": 2
+            }
+        },
+        "sub_task": {
+            "prefill_text": [
+                "Let me break down this problem.\n- 1.",
+                "I need to identify what's being asked.\n- 1.",
+                "First, let me understand the problem.\n- 1."
+            ],
+            "description": "Break down the math problem",
+            "show_in_history": true,
+            "special_model": false,
+            "next_step": {
+                "thinking": 2
+            }
+        },
+        "thinking": {
+            "prefill_text": [],
+            "description": "Work through calculations",
+            "show_in_history": true,
+            "special_model": false,
+            "next_step": {
+                "double_check": 2,
+                "thinking": 2
+            }
+        },
+        "reflection": {
+            "prefill_text": [
+                "Wait, I made an error. Let me reconsider.\n</reflection>",
+                "Hold on, something is wrong with my approach.\n</reflection>"
+            ],
+            "description": "Reflect on errors",
+            "show_in_history": true,
+            "special_model": false,
+            "next_step": {
+                "thinking_from_scratch": 2
+            }
+        },
+        "double_check": {
+            "prefill_text": [
+                "Let me verify my calculation",
+                "Time to check my work",
+                "Let me make sure this is correct"
+            ],
+            "description": "Verify calculations",
+            "show_in_history": true,
+            "special_model": false,
+            "next_step": {
+                "answer": 1
+            }
+        },
+        "answer": {
+            "prefill_text": ["The answer is:"],
+            "description": "Final answer",
+            "show_in_history": true,
+            "special_model": false,
+            "next_step": {}
+        },
+        "thinking_from_scratch": {
+            "prefill_text": [
+                "My previous approach was wrong. Let me start fresh.\n",
+                "I need to rethink this entirely.\n"
+            ],
+            "description": "Rethink from scratch",
+            "show_in_history": true,
+            "special_model": false,
+            "next_step": {
+                "thinking": 2
+            }
+        }
+    }
+}

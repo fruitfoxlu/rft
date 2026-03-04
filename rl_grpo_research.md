@@ -3960,26 +3960,127 @@ Decision gate: Gate-1a FAIL, Gate-1b FAIL
 
 ```
 
-### §19.3 Analysis
+### §19.3 Analysis (Updated Postmortem)
 
-**Findings:**
+**Result summary:**
 
-- **Null effect**: Δ=+1.00pp (p=0.3428). Both gates FAIL. Best checkpoint: c1-step100.
-- Discordant pairs: b=40 (base✓ new✗), c=50 (base✗ new✓), b+c=90 (9.0%).
-- 95% CI: [-0.90, +2.90]pp.
-- Checkpoint comparison:
-  - c1-step50: 66.4% (Δ=-0.70pp, p=0.5296)
-  - c1-step100: 68.1% (Δ=+1.00pp, p=0.3428)
-  - c1-step200: 67.2% (Δ=+0.10pp, p=1.0000)
-- Training reward: 1.004 (step 1) → 0.762 (step 200) — decreasing.
+- **Null result** on OOD-1000: best checkpoint c1-step100 is +1.00pp (p=0.3428), both gates FAIL.
+- Checkpoint trajectory is unstable and small:
+  - c1-step50: 66.4% (Δ=-0.70pp)
+  - c1-step100: 68.1% (Δ=+1.00pp)
+  - c1-step200: 67.2% (Δ=+0.10pp)
+- Discordant pairs remain balanced (b=40, c=50), consistent with weak directional learning.
 
-**Theory:**
+### §19.4 Root-Cause Findings
 
-- Another null result. The hypothesis that "among correct solutions, some have clean logical reasoning while others got lucky" is not supported by the data.
-- The model DOES change (b+c=90, 9.0% of problems), but changes remain directionless — improvements cancel regressions.
+This section summarizes what we learned after inspecting C1 code, logs, metrics, and eval artifacts in detail.
 
-**Suggestions:**
+1. **C1 reward mostly behaves like scaled EM, not a qualitatively new signal.**
+   - C1 computes `reward = EM * (1 + alpha * judge)` and only calls judge when `EM=1`.
+   - In this run, per-step `judge_score / correctness` is high and narrow (mean ~0.93, median ~0.94).
+   - Empirically, `reward_mean` is almost perfectly correlated with `correctness` (corr ~0.995).
+   - Net effect: C1 mostly rescales the same EM signal rather than changing optimization direction.
 
-- This modification does not help. Consider:
-  - Moving on to remaining tracks rather than iterating further.
-  - If all tracks fail, the bottleneck may be fundamental (model capacity, LoRA limits, or train/eval domain gap).
+2. **Effective GRPO signal remains weak after group-centering.**
+   - With `dr_grpo`, rewards are centered within each prompt group.
+   - In C1, within-group variance is limited relative to total variance:
+     - mean `group_reward_std` ~0.175
+     - mean `reward_std` ~0.676
+     - within-group variance fraction ~7.8%
+   - This means most reward variation is between prompts (removed by centering), so usable gradient is small.
+
+3. **Update budget / movement is modest for this objective.**
+   - C1 runs with `n_samples_per_prompt=8`, `num_episodes=1`, `max_epochs=1`, 200 global steps.
+   - Policy updates are conservative (`ppo_clip_ratio` ~0.014, `ratio_max` ~1.24).
+   - LoRA parameter movement is real but small (`||delta step10->200|| ~0.088`), indicating limited optimization progress.
+
+4. **Judge reliability had noise, but this was not the main failure mode.**
+   - C1 logs show many transient judge call failures (mostly 429 throttling), but full fallback was rare.
+   - Therefore, C1 did **not** collapse into the C2-style "all-default reward" failure pattern.
+   - Judge instability likely added noise, but evidence does not support it as the primary root cause.
+
+5. **No critical data/eval/pipeline defect was found for C1.**
+   - Train/OOD split is disjoint.
+   - Eval parser/scoring aligns with training parser.
+   - C1 checkpoints and eval summaries match the expected run artifacts.
+
+### §19.5 What C1 Actually Tells Us
+
+- C1 **does not** prove GRPO is ineffective.
+- It shows that this particular shaping (`bonus only on already-correct responses`) is too close to EM to unlock enough additional gradient.
+- C1 is best treated as a **negative control** for Track C: reward shaping must inject signal on EM=0 cases to move learning materially.
+
+### §19.6 Implications for C2/C3
+
+- C2 and C3 are better aligned with the identified bottleneck:
+  - C2 adds graded signal on wrong answers (all-wrong groups are no longer zero-signal).
+  - C3 adds signed contrast on wrong answers plus quality differentiation on correct answers.
+- For stronger statistical power in future reruns, increase update budget (e.g., more episodes and/or higher `n_samples_per_prompt`) after current C2/C3 baseline-comparable runs complete.
+
+### §19.7 C2/C3 Success Criteria (Compact)
+
+To avoid post-hoc interpretation, evaluate C2/C3 with the following checklist.
+
+1. **Run validity (must pass):**
+   - Training reaches 200 global steps and checkpoints at 50/100/200 are available.
+   - Judge path is active (no long default-reward collapse due to API failures).
+   - Reward shaping is actually applied on EM=0 samples:
+     - C2: non-zero partial-credit rewards appear on wrong answers.
+     - C3: both positive and negative rewards appear on wrong answers.
+
+2. **Primary endpoint (same gate policy as all tracks):**
+   - Gate-1a: Δ>=+2.0pp and McNemar p<0.10 on OOD-1000.
+   - Gate-1b: Δ>=+3.0pp and McNemar p<0.05 on OOD-1000.
+
+3. **Secondary evidence (if gate miss but signal exists):**
+   - Directional consistency across checkpoints (improvements exceed regressions; not a one-checkpoint fluke).
+   - Stable learning dynamics (non-zero group reward variance, no PPO instability explosion).
+   - Optional confirmatory metric: pass@k on baseline-wrong subset improves.
+
+4. **Decision rule:**
+   - If C2 or C3 passes Gate-1a: claim that GRPO works under shaped reward.
+   - If gate misses but directional signal is consistent: treat as likely underpowered, increase update budget and rerun.
+   - If gate misses with no directional/mechanistic signal: revisit model/data assumptions before further reward tuning.
+
+### §19.8 Next Variant: Learning-Zone Soft Reweighting (Prompt Frequency)
+
+**Goal:** Increase the fraction of training prompts that are in GRPO's effective learning zone (neither almost always wrong nor almost always correct under current policy sampling).
+
+**Method (no reward-function change):**
+
+1. For each prompt/problem `i`, estimate current success rate:
+   - `p_hat_i = k_correct_i / n_samples_i`
+2. Convert to a soft sampling weight:
+   - `w_i = floor + p_hat_i * (1 - p_hat_i)`
+   - normalize weights so average contribution is stable.
+3. Use these weights to change **prompt sampling frequency** (show learning-zone prompts more often, easy/hard extremes less often), while keeping all prompts in training via `floor > 0`.
+
+Equivalent intuition:
+- More updates on prompts with `p_hat` near 0.5 (highest uncertainty, strongest comparative signal).
+- Fewer updates on prompts with `p_hat` near 0 or 1 (low marginal signal).
+
+**Why this is worth trying for C2/C3:**
+
+- GRPO with centered/group-relative advantages extracts most useful gradient when sampled responses for a prompt are mixed in quality.
+- Binary-verifier math setups often spend substantial budget in all-wrong or all-correct regions, where usable signal is weak.
+- Soft reweighting reallocates update budget toward prompts where ranking signal exists, without introducing hard filtering bias.
+- This is orthogonal to C2/C3 reward design: reward function stays the same; only prompt frequency changes.
+
+**Experiment hygiene:**
+
+- Keep evaluator and gate policy unchanged (same OOD-1000 protocol).
+- Treat as a distinct ablation (`C2-soft` / `C3-soft`) relative to baseline C2/C3.
+
+**Best timing relative to current plan:**
+
+- **Do not change** currently running C2/C3 jobs (preserve clean baseline comparability).
+- Add soft reweighting **immediately after baseline C2/C3 finish**, before committing all effort to MCTS CoT/SFT/DPO.
+- Recommended sequence:
+  1. Finish baseline C2/C3 and evaluate.
+  2. Build per-prompt `p_hat` stats from those run artifacts.
+  3. Launch one soft-reweighted follow-up (same core hyperparameters, same eval).
+  4. In parallel, start MCTS CoT/SFT/DPO pipeline prep/execution.
+
+Rationale for timing:
+- This gives one low-intrusion, mechanism-aligned GRPO follow-up while evidence/context is fresh.
+- It avoids delaying the MCTS path, which remains the main alternative if RL reward shaping still underdelivers.

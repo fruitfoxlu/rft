@@ -3911,3 +3911,75 @@ Estimated time: ~3-4 hours per track (training dominates, judge API calls add ~3
 4. Consider also: Qwen2.5-Math-1.5B-Instruct (tiny, fast iteration) and Qwen2.5-Math-72B-Instruct (if compute allows)
 
 **Status**: Idea documented. Circle back after Track C results.
+
+---
+
+## §19 Track C1 Results: Judge Reward — Quality Differentiation Among Correct
+
+### §19.1 Experiment Record
+
+```
+Attempt ID: Q2-C1
+Track: C1
+Date: 2026-03-04
+Changed variable: reward_func_em.py → reward_func_judge_c1.py (α=0.5)
+Hypothesis: Among correct solutions, some have clean logical reasoning while others got lucky. C1 differentiates by adding judge bonus on EM=1 responses. reward = EM × (1 + 0.5 × judge_score). EM=1 reward range: [1.0, 1.5]. EM=0 reward: 0.0.
+Training steps: 200
+OOD-1000 result (best checkpoint: c1-step100):
+  Baseline: 67.1% (671/1000)
+  C1:     68.1% (681/1000)
+  Δ: +1.00pp
+  McNemar p: 0.3428
+  95% CI: [-0.90, +2.90]pp
+  b (base✓ new✗): 40
+  c (base✗ new✓): 50
+  b+c: 90
+Decision gate: Gate-1a FAIL, Gate-1b FAIL
+```
+
+### §19.2 Training Trajectory
+
+```
+   Step   Reward  Correct   Judge  RatioMax  GradNorm
+  ---------------------------------------------------
+      1    1.004    0.680   0.648     1.201    0.0225
+      2    1.067    0.734   0.666     1.236    0.0241
+      3    0.915    0.625   0.580     1.220    0.0158
+      4    1.198    0.828   0.739     1.233    0.0335
+      5    1.250    0.844   0.813     1.217    0.0154
+     20    1.055    0.719   0.673     1.226    0.0160
+     40    0.969    0.656   0.625     1.276    0.0197
+     60    0.873    0.594   0.559     1.246    0.0210
+     80    0.927    0.625   0.604     1.263    0.0218
+    100    1.077    0.734   0.684     1.246    0.0125
+    120    1.088    0.766   0.645     1.231    0.0232
+    140    1.070    0.719   0.702     1.236    0.0154
+    160    0.994    0.695   0.597     1.231    0.0248
+    180    0.872    0.594   0.557     1.273    0.0257
+    200    0.762    0.516   0.493     1.257    0.0173
+
+```
+
+### §19.3 Analysis
+
+**Findings:**
+
+- **Null effect**: Δ=+1.00pp (p=0.3428). Both gates FAIL. Best checkpoint: c1-step100.
+- Discordant pairs: b=40 (base✓ new✗), c=50 (base✗ new✓), b+c=90 (9.0%).
+- 95% CI: [-0.90, +2.90]pp.
+- Checkpoint comparison:
+  - c1-step50: 66.4% (Δ=-0.70pp, p=0.5296)
+  - c1-step100: 68.1% (Δ=+1.00pp, p=0.3428)
+  - c1-step200: 67.2% (Δ=+0.10pp, p=1.0000)
+- Training reward: 1.004 (step 1) → 0.762 (step 200) — decreasing.
+
+**Theory:**
+
+- Another null result. The hypothesis that "among correct solutions, some have clean logical reasoning while others got lucky" is not supported by the data.
+- The model DOES change (b+c=90, 9.0% of problems), but changes remain directionless — improvements cancel regressions.
+
+**Suggestions:**
+
+- This modification does not help. Consider:
+  - Moving on to remaining tracks rather than iterating further.
+  - If all tracks fail, the bottleneck may be fundamental (model capacity, LoRA limits, or train/eval domain gap).

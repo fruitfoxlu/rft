@@ -112,44 +112,29 @@ def _call_judge(problem: str, response: str, ground_truth: str,
         max_output_tokens=16384,
     )
 
-    # Try primary model (gemini-3.1-pro-preview) with 3 retries
-    for attempt in range(3):
-        try:
-            client = _get_client()
-            resp = client.models.generate_content(
-                model=GEMINI_MODEL, contents=prompt, config=config,
-            )
-            score = _parse_score(resp.text)
-            if score is not None:
-                return score
-            logger.warning(f"Judge returned unparseable: {resp.text!r}")
-            return default
-        except Exception as e:
-            logger.warning(f"Judge call attempt {attempt+1} failed: {e}")
-            if attempt < 2:
-                time.sleep(2 ** attempt)
-            continue
+    # Alternate between primary and fallback models, 5 rounds × 3 attempts each
+    models = [GEMINI_MODEL, GEMINI_FALLBACK]
+    for round_idx in range(5):
+        model = models[round_idx % 2]
+        for attempt in range(3):
+            try:
+                client = _get_client()
+                resp = client.models.generate_content(
+                    model=model, contents=prompt, config=config,
+                )
+                score = _parse_score(resp.text)
+                if score is not None:
+                    return score
+                logger.warning(f"Judge returned unparseable ({model}): {resp.text!r}")
+                return default
+            except Exception as e:
+                logger.warning(f"Judge {model} round {round_idx+1} attempt {attempt+1} failed: {e}")
+                if attempt < 2:
+                    time.sleep(2 ** attempt)
+                continue
+        logger.warning(f"Round {round_idx+1} ({model}) exhausted, switching model")
 
-    # Fallback to gemini-3-flash-preview with 3 retries
-    logger.warning(f"Primary judge failed, falling back to {GEMINI_FALLBACK}")
-    for attempt in range(3):
-        try:
-            client = _get_client()
-            resp = client.models.generate_content(
-                model=GEMINI_FALLBACK, contents=prompt, config=config,
-            )
-            score = _parse_score(resp.text)
-            if score is not None:
-                return score
-            logger.warning(f"Fallback judge returned unparseable: {resp.text!r}")
-            return default
-        except Exception as e:
-            logger.warning(f"Fallback judge attempt {attempt+1} failed: {e}")
-            if attempt < 2:
-                time.sleep(2 ** attempt)
-            continue
-
-    logger.warning(f"All judge attempts failed, defaulting to {default}")
+    logger.warning(f"All 5 rounds failed, defaulting to {default}")
     return default
 
 

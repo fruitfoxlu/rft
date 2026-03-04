@@ -67,19 +67,27 @@ fi
 
 # ── Verify Gemini 3.1 Pro access (google-genai SDK) ─────────────────
 echo "=== Testing Gemini 3.1 Pro (genai SDK, project=${GCP_PROJECT:-wf30-poc}) ==="
+JUDGE_OK=0
 for _try in 1 2 3; do
-    JUDGE_TEST=$(python3 -c "
+    if JUDGE_TEST=$(python3 -c "
 from google import genai
 client = genai.Client(vertexai=True, project='wf30-poc', location='global')
 resp = client.models.generate_content(model='gemini-3.1-pro-preview', contents='Say ready')
 print(resp.text.strip())
-" 2>&1) && break
+" 2>&1); then
+        JUDGE_OK=1
+        break
+    fi
     echo "  Attempt $_try failed, retrying in 5s..."
     sleep 5
 done
 echo "  Gemini test: $JUDGE_TEST"
+if [ "$JUDGE_OK" -ne 1 ]; then
+    echo "ERROR: Gemini API preflight failed after 3 attempts."
+    exit 1
+fi
 if [ -z "$JUDGE_TEST" ]; then
-    echo "WARNING: Gemini API test returned empty. Judge may not work during training."
+    echo "WARNING: Gemini API test succeeded but returned empty output."
 fi
 
 # --- Pre-flight LR check ---

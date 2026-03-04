@@ -122,11 +122,17 @@ def _call_judge(problem: str, response: str, ground_truth: str,
                 resp = client.models.generate_content(
                     model=model, contents=prompt, config=config,
                 )
-                score = _parse_score(resp.text)
+                text = getattr(resp, "text", None)
+                score = _parse_score(text)
                 if score is not None:
                     return score
-                logger.warning(f"Judge returned unparseable ({model}): {resp.text!r}")
-                return default
+                logger.warning(
+                    f"Judge returned unparseable ({model}) "
+                    f"round {round_idx+1} attempt {attempt+1}: {text!r}"
+                )
+                if attempt < 2:
+                    time.sleep(2 ** attempt)
+                continue
             except Exception as e:
                 logger.warning(f"Judge {model} round {round_idx+1} attempt {attempt+1} failed: {e}")
                 if attempt < 2:

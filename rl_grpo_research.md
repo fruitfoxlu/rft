@@ -4125,3 +4125,76 @@ Rationale:
 - C2 showed weak effective GRPO signal under `n=8`.
 - Prior Track B evidence indicates larger group size improves ranking statistics and learning signal.
 - This change is consistent with the planned high-upside C3 variant before full pivot to MCTS CoT/SFT/DPO.
+
+---
+
+## §18 Track C2 Results: Judge Reward — Partial Credit for Wrong Answers
+
+### §18.1 Experiment Record
+
+```
+Attempt ID: Q2-C2
+Track: C2
+Date: 2026-03-05
+Changed variable: reward_func_em.py → reward_func_judge_c2.py (α=0.3)
+Hypothesis: Binary EM reward provides zero gradient on all-wrong groups. C2 gives partial credit (α=0.3) to wrong answers based on reasoning quality, creating reward variance within these groups. reward = EM + 0.3 × judge_score × (1-EM). Invariant: max(EM=0 reward) = 0.3 < 1.0 = min(EM=1 reward).
+Training steps: 200
+OOD-1000 result (best checkpoint: c2-step100):
+  Baseline: 67.1% (671/1000)
+  C2:     68.8% (688/1000)
+  Δ: +1.70pp
+  McNemar p: 0.0857
+  95% CI: [-0.10, +3.60]pp
+  b (base✓ new✗): 35
+  c (base✗ new✓): 52
+  b+c: 87
+Decision gate: Gate-1a FAIL, Gate-1b FAIL
+```
+
+### §18.2 Training Trajectory
+
+```
+   Step   Reward  Correct   Judge  RatioMax  GradNorm
+  ---------------------------------------------------
+      1    0.748    0.688   0.202     1.183    0.0127
+      2    0.430    0.383   0.157     1.229    0.0154
+      3    0.749    0.703   0.152     1.232    0.0104
+      4    0.677    0.602   0.251     1.214    0.0071
+      5    0.674    0.609   0.215     1.229    0.0159
+     20    0.755    0.727   0.095     1.215    0.0100
+     40    0.709    0.648   0.202     1.231    0.0116
+     60    0.694    0.609   0.283     1.219    0.0121
+     80    0.728    0.648   0.265     1.274    0.0110
+    100    0.754    0.711   0.145     1.225    0.0115
+    120    0.791    0.758   0.110     1.244    0.0097
+    140    0.773    0.711   0.207     1.251    0.0095
+    160    0.525    0.453   0.241     1.249    0.0181
+    180    0.758    0.727   0.106     1.270    0.0150
+    200    0.870    0.828   0.139     1.242    0.0084
+
+```
+
+### §18.3 Analysis
+
+**Findings:**
+
+- **Trending positive but not significant**: Δ=+1.70pp (p=0.0857). Both gates FAIL. Best checkpoint: c2-step100.
+- Discordant pairs: b=35 (base✓ new✗), c=52 (base✗ new✓), b+c=87 (8.7%).
+- 95% CI: [-0.10, +3.60]pp.
+- Checkpoint comparison:
+  - c2-step50: 68.1% (Δ=+1.00pp, p=0.3682)
+  - c2-step100: 68.8% (Δ=+1.70pp, p=0.0857)
+  - c2-step200: 68.7% (Δ=+1.60pp, p=0.1293)
+- Training reward: 0.748 (step 1) → 0.870 (step 200) — increasing.
+
+**Theory:**
+
+- Another null result. The hypothesis that "binary em reward provides zero gradient on all-wrong groups" is not supported by the data.
+- The model DOES change (b+c=87, 8.7% of problems), but changes remain directionless — improvements cancel regressions.
+
+**Suggestions:**
+
+- Result is suggestive but inconclusive. Consider:
+  - Running longer (more steps) to see if the trend continues.
+  - Trying a stronger version of this modification.
+  - Running a second seed to check if the trend replicates.

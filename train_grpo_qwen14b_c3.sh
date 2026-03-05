@@ -27,7 +27,9 @@
 #   │ judge                    │ N/A                       │ Gemini 3.1 Pro (SDK) ★    │
 #   │ JUDGE_ALPHA_POS          │ N/A                       │ 0.5 ★                     │
 #   │ JUDGE_ALPHA_NEG          │ N/A                       │ 0.6 ★                     │
-#   │ (all others)             │ same                      │ same                      │
+#   │ n_samples_per_prompt     │ 8                         │ 32 ★                      │
+#   │ micro_rollout_batch_size │ 4                         │ 2 ★                       │
+#   │ (others)                 │ same                      │ same                      │
 #   └──────────────────────────┴───────────────────────────┴───────────────────────────┘
 
 set -euo pipefail
@@ -93,7 +95,7 @@ fi
 # --- Pre-flight LR check ---
 echo ""
 echo "=== Pre-flight LR schedule check ==="
-POOL=$(wc -l < "$TRAIN_DATA") NS=8 TBS=16 RBS=16 EP=1 WARMUP=0.05 LR=5e-7 \
+POOL=$(wc -l < "$TRAIN_DATA") NS=32 TBS=16 RBS=16 EP=1 WARMUP=0.05 LR=5e-7 \
     bash "${SCRIPT_DIR}/preflight_lr.sh" || { echo "ABORT: LR schedule check failed."; exit 1; }
 echo ""
 
@@ -107,6 +109,7 @@ echo "  Save path:   $SAVE_PATH"
 echo "  Checkpoints: $CKPT_PATH"
 echo ""
 echo "  ★ Track C3: Unified reward — bonus for correct, negative for bad wrong"
+echo "  ★ Group size: n_samples_per_prompt=32 (stronger GRPO ranking signal)"
 echo "  ★ EM=1 reward range: [1.0, 1.5], EM=0 reward range: [-0.30, +0.24]"
 echo "  ★ 2 vLLM engines (no GPU needed for judge), 200 global steps"
 echo ""
@@ -121,11 +124,11 @@ python -m openrlhf.cli.train_ppo_ray \
     --remote_rm_url "$REWARD_FUNC" \
     --advantage_estimator dr_grpo \
     --init_kl_coef 0.001 \
-    --n_samples_per_prompt 8 \
+    --n_samples_per_prompt 32 \
     --max_epochs 1 \
     --num_episodes 1 \
     --rollout_batch_size 16 \
-    --micro_rollout_batch_size 4 \
+    --micro_rollout_batch_size 2 \
     --train_batch_size 16 \
     --micro_train_batch_size 2 \
     --max_len 3072 \

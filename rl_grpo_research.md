@@ -4084,3 +4084,44 @@ Equivalent intuition:
 Rationale for timing:
 - This gives one low-intrusion, mechanism-aligned GRPO follow-up while evidence/context is fresh.
 - It avoids delaying the MCTS path, which remains the main alternative if RL reward shaping still underdelivers.
+
+### §19.9 High-Upside Variant: C3 + n=32 + Soft Reweighting
+
+If baseline C2/C3 do not pass gate, the highest-upside GRPO follow-up is:
+
+- **Reward:** C3 (unified reward, including signed signal on wrong answers)
+- **Group size:** `n_samples_per_prompt=32`
+- **Sampling:** learning-zone soft prompt reweighting (`w_i = floor + p_hat_i(1-p_hat_i)`)
+
+**Why this combo:**
+
+- C3 improves reward informativeness on EM=0 and EM=1 cases.
+- `n=32` improves within-prompt ranking statistics and reduces estimator noise.
+- Soft reweighting shifts update budget toward prompts with mixed outcomes, where GRPO has strongest effective signal.
+
+**Positioning:**
+
+- This is the **max-improvement variant** (best chance to maximize effect size), not the cleanest attribution variant.
+- If attribution is needed, run `C3-n32` first, then `C3-n32-soft`.
+- If only outcome matters, run `C3-n32-soft` directly.
+
+**Timing:**
+
+- Keep currently running C2/C3 unchanged.
+- Launch this variant immediately after baseline C2/C3 evaluation, before fully pivoting to MCTS CoT/SFT/DPO.
+- Keep evaluator/gates unchanged (same OOD-1000 protocol) for comparability.
+
+### §19.10 Execution Update: C3 Group Size Set to 32
+
+Decision (2026-03-05):
+
+- For the next C3 launch, set `n_samples_per_prompt=32` (from 8).
+- Keep C3 reward formula unchanged.
+- Keep evaluator/gates unchanged.
+- Set `micro_rollout_batch_size=2` to keep rollout memory pressure comparable to prior stable `n=32` runs.
+
+Rationale:
+
+- C2 showed weak effective GRPO signal under `n=8`.
+- Prior Track B evidence indicates larger group size improves ranking statistics and learning signal.
+- This change is consistent with the planned high-upside C3 variant before full pivot to MCTS CoT/SFT/DPO.

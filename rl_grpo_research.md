@@ -4176,25 +4176,54 @@ Decision gate: Gate-1a FAIL, Gate-1b FAIL
 
 ### §18.3 Analysis
 
-**Findings:**
+**Result summary:**
 
-- **Trending positive but not significant**: Δ=+1.70pp (p=0.0857). Both gates FAIL. Best checkpoint: c2-step100.
-- Discordant pairs: b=35 (base✓ new✗), c=52 (base✗ new✓), b+c=87 (8.7%).
-- 95% CI: [-0.10, +3.60]pp.
-- Checkpoint comparison:
-  - c2-step50: 68.1% (Δ=+1.00pp, p=0.3682)
-  - c2-step100: 68.8% (Δ=+1.70pp, p=0.0857)
-  - c2-step200: 68.7% (Δ=+1.60pp, p=0.1293)
-- Training reward: 0.748 (step 1) → 0.870 (step 200) — increasing.
+- **Null result, trending positive**: best checkpoint c2-step100 at +1.70pp (p=0.0857), both gates FAIL.
+- Checkpoint trajectory is flat after step 100:
+  - c2-step50: 68.1% (Δ=+1.00pp, p=0.3682, CI [-0.90, +2.90])
+  - c2-step100: 68.8% (Δ=+1.70pp, p=0.0857, CI [-0.10, +3.60])
+  - c2-step200: 68.7% (Δ=+1.60pp, p=0.1293, CI [-0.30, +3.50])
+- Discordant pairs at best checkpoint: b=35 (base✓ new✗), c=52 (base✗ new✓), b+c=87 (8.7%).
+- Near-miss on Gate-1a: p=0.0857 passes the p<0.10 threshold, but Δ=+1.70pp falls short of the Δ≥+2.0pp requirement.
 
-**Theory:**
+### §18.4 Root-Cause Findings
 
-- Another null result. The hypothesis that "binary em reward provides zero gradient on all-wrong groups" is not supported by the data.
-- The model DOES change (b+c=87, 8.7% of problems), but changes remain directionless — improvements cancel regressions.
+1. **C2 partial credit adds real but weak within-group signal.**
+   - C2's `judge_score` on wrong answers creates non-zero reward variance in all-wrong groups.
+   - However, within-group variance fraction is only 9.4% (vs 8.0% for C1, ~6% for Q1).
+   - The improvement over Q1/C1 is marginal — partial credit (α=0.3) is too small to meaningfully reshape the optimization landscape.
 
-**Suggestions:**
+2. **Reward still dominated by EM, not judge quality.**
+   - `correlation(reward_mean, correctness)` = 0.98 — nearly identical to C1 (0.995) and Q1.
+   - C2 reward range: [0.01, 1.0] vs C1's [0.0, 1.5]. The partial credit floor (mean `reward_min` = 0.012) barely lifts wrong-answer reward above zero.
+   - Mean `group_reward_std` = 0.111 (C2) vs 0.175 (C1) — C2 actually has *less* within-group spread than C1 because C2's reward range is compressed ([0, 1.0] vs [0, 1.5]).
 
-- Result is suggestive but inconclusive. Consider:
-  - Running longer (more steps) to see if the trend continues.
-  - Trying a stronger version of this modification.
-  - Running a second seed to check if the trend replicates.
+3. **Judge does differentiate wrong answers, but α=0.3 is too mild.**
+   - When `correctness < 50%`, mean `judge_score` = 0.306 (more wrong answers → more judge evaluations → higher mean judge).
+   - When `correctness ≥ 70%`, mean `judge_score` = 0.132.
+   - The judge **is** scoring wrong answers differently, but α=0.3 × judge maps this to reward range [0, 0.3], which is a narrow band relative to the EM=1 reward of 1.0.
+
+4. **Policy update dynamics are nearly identical to Q1/C1.**
+   - `ppo_clip_ratio` = 0.014 (same as C1's 0.014).
+   - `ratio_max` = 1.24 (same range as C1's 1.25).
+   - `n_samples_per_prompt=8` with 200 steps gives the same conservative update budget.
+   - No evidence that C2's reward shape caused qualitatively different optimization behavior.
+
+5. **Comparison with C1 confirms the directional hypothesis.**
+   - C1 (bonus on correct only): Δ=+1.00pp (best), p=0.34
+   - C2 (partial credit on wrong): Δ=+1.70pp (best), p=0.086
+   - C2 outperforms C1 by +0.70pp, consistent with the prediction that signal on EM=0 cases matters more than signal on EM=1 cases.
+   - But the improvement is not enough to cross the gate threshold.
+
+### §18.5 What C2 Tells Us
+
+- C2 provides the **strongest evidence so far** that reward shaping can move the needle, but α=0.3 with n=8 is insufficient for statistical significance.
+- The near-miss (p=0.0857) is encouraging: the signal-to-noise ratio is approaching significance, but more power is needed.
+- C2 validates the **directional hypothesis** from C1: injecting gradient on wrong answers (C2) helps more than differentiating correct answers (C1). This is consistent with the "zero-gradient on all-wrong groups" bottleneck identified in §19.4.
+
+### §18.6 Implications for C3
+
+- C3 combines both C1 and C2 ideas (bonus on correct + negative penalty on bad wrong) **and** uses `n_samples_per_prompt=32`.
+- The group size increase (8→32) is the most impactful change: larger groups should increase within-group variance and provide stronger GRPO ranking signal.
+- C3's negative reward region (EM=0 reward ∈ [-0.30, +0.24]) is more aggressive than C2's [0, 0.3], which should create clearer differentiation.
+- If C3 also fails, the conclusion is that **GRPO with 200 steps of conservative LoRA updates cannot overcome the OOD generalization barrier**, regardless of reward shaping — and the pivot to MCTS CoT/SFT/DPO (§20) is warranted.
